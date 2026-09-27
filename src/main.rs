@@ -1,0 +1,288 @@
+mod archive;
+mod concurrency;
+mod linker;
+mod lockfile;
+mod manifest;
+mod registry;
+mod resolver;
+mod store;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::env;
+use std::time::Instant;
+
+#[derive(Parser)]
+#[command(name = "nermo", version, about = "Local-first JS package manager")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Discover the project and show what would be installed.
+    Install {
+        /// Require a compatible, up-to-date lockfile; never re-resolve.
+        #[arg(long)]
+        frozen: bool,
+        /// After installing, remove any store package this project no
+        /// longer depends on if no other tracked project needs it either
+        /// (e.g. an old `next` version left behind after an upgrade).
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Ensure a package version is present in the global store, downloading
+    /// it only if it isn't already cached (Phase 2 registry + Phase 3 store).
+    Fetch {
+        /// e.g. "react@19.0.0" or "@types/node@22.0.0"
+        spec: String,
+    },
+    /// Inspect or maintain the global package store.
+    Store {
+        #[command(subcommand)]
+        action: Option<StoreCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreCommand {
+    /// Remove packages not referenced by any tracked project.
+    Prune {
+        /// Show what would be removed without removing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Install { frozen, prune } => install(frozen, prune),
+        Command::Fetch { spec } => fetch(&spec),
+        Command::Store { action: None } => store_stats(),
+        Command::Store { action: Some(StoreCommand::Prune { dry_run, yes }) } => store_prune(dry_run, yes),
+    }
+}
+
+fn fetch(spec: &str) -> Result<()> {
+    let (name, version) = spec
+        .rsplit_once('@')
+        .filter(|(n, _)| !n.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("expected \"name@version\", got {spec}"))?;
+
+    let client = registry::Client::new()?;
+    let store = store::Store::open()?;
+    let (path, reused) = store.ensure(&client, name, version)?;
+
+    if reused {
+        println!("Already in store: {}", path.display());
+    } else {
+        println!("Downloaded and stored {name}@{version} at {}", path.display());
+    }
+    Ok(())
+}
+
+fn install(frozen: bool, prune: bool) -> Result<()> {
+    let install_start = Instant::now();
+    let cwd = env::current_dir()?;
+    let root = manifest::find_project_root(&cwd)?;
+    let manifest = manifest::load(&root)?;
+
+    println!("Project: {}", manifest.name.as_deref().unwrap_or("(unnamed)"));
+    println!("Root: {}", root.display());
+
+    let mut direct = manifest.dependencies.clone();
+    direct.extend(manifest.dev_dependencies.clone());
+    if direct.is_empty() {
+        println!("No dependencies declared.");
+        return Ok(());
+    }
+
+    let client = registry::Client::new()?;
+    let existing_lock = lockfile::Lockfile::load(&root)?;
+    let reusable_lock = existing_lock.as_ref().filter(|lock| lock.matches_manifest(&direct));
+
+    let resolve_start = Instant::now();
+    let (graph, lock_to_write) = match reusable_lock {
+        Some(lock) => {
+            println!("\nUsing existing lockfile (package.json unchanged).");
+            (lock.to_graph()?, None)
+        }
+        None if frozen => {
+            if existing_lock.is_some() {
+                anyhow::bail!("--frozen requires the lockfile, but package.json has changed since it was written");
+            }
+            anyhow::bail!("--frozen requires an existing {}, but none was found", lockfile::FILE_NAME);
+        }
+        None => {
+            if existing_lock.is_some() {
+                println!("\npackage.json has changed since the lockfile was written; not using it.");
+            }
+            println!("Resolving dependencies...");
+            let graph = resolver::Resolver::new(&client).resolve(&direct)?;
+            let lock = lockfile::Lockfile::from_graph(&direct, &graph);
+            (graph, Some(lock))
+        }
+    };
+    let resolve_elapsed = resolve_start.elapsed();
+    println!("Found {} packages.", graph.packages.len());
+
+    let mut versions_per_name: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for (name, version) in graph.packages.keys() {
+        versions_per_name.entry(name).or_default().push(version);
+    }
+    let conflicts: Vec<_> = versions_per_name.iter().filter(|(_, vs)| vs.len() > 1).collect();
+    if !conflicts.is_empty() {
+        println!("Multiple versions in the graph:");
+        for (name, versions) in conflicts {
+            println!("  {name}: {}", versions.join(", "));
+        }
+    }
+
+    println!("\nChecking global store...");
+    let store = store::Store::open()?;
+    let keys: Vec<_> = graph.packages.keys().cloned().collect();
+    let store_start = Instant::now();
+    let downloaded = store.ensure_all(&client, &keys, install_concurrency())?;
+    let store_elapsed = store_start.elapsed();
+    println!("Downloaded: {downloaded}, reused: {}", keys.len() - downloaded);
+
+    println!("\nLinking dependencies...");
+    let link_start = Instant::now();
+    linker::Linker::new(&store, &root).link(&graph)?;
+    let link_elapsed = link_start.elapsed();
+
+    if let Some(lock) = lock_to_write {
+        lock.save(&root)?;
+    }
+    store.track_project(&root, graph.packages.keys().cloned())?;
+
+    if prune {
+        // Recomputed *after* this project's own tracked entry was updated
+        // above, so a version this project just dropped (e.g. an old `next`
+        // it upgraded away from) is already excluded from "referenced" if
+        // this was the last project still using it.
+        let mut unused = store.unused_packages()?;
+        unused.sort();
+        if unused.is_empty() {
+            println!("\nNo unused packages to prune.");
+        } else {
+            let mut freed = 0u64;
+            for (name, version) in &unused {
+                freed += store.remove_package(name, version)?;
+            }
+            println!("\nPruned {} unused package(s), freed {}:", unused.len(), format_bytes(freed));
+            for (name, version) in &unused {
+                println!("  {name}@{version}");
+            }
+        }
+    }
+
+    println!("\nInstallation completed.\n");
+    println!("Packages: {}", graph.packages.len());
+    println!("Downloaded: {downloaded}");
+    println!("Reused: {}", keys.len() - downloaded);
+    println!(
+        "Duration: {} (resolve {}, store {}, link {})",
+        format_duration(install_start.elapsed()),
+        format_duration(resolve_elapsed),
+        format_duration(store_elapsed),
+        format_duration(link_elapsed),
+    );
+    Ok(())
+}
+
+/// Human-scaled duration: milliseconds below one second, seconds (2 decimal
+/// places) at or above it — matches `format_bytes`'s "smallest readable
+/// unit" approach instead of always printing fractional seconds.
+fn format_duration(d: std::time::Duration) -> String {
+    let ms = d.as_secs_f64() * 1000.0;
+    if ms < 1000.0 {
+        format!("{ms:.0}ms")
+    } else {
+        format!("{:.2}s", d.as_secs_f64())
+    }
+}
+
+/// Bounded thread count for concurrent downloads (PRD §17.1/§17.3).
+fn install_concurrency() -> usize {
+    env::var("NERMO_CONCURRENCY").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(16)
+}
+
+fn store_stats() -> Result<()> {
+    let store = store::Store::open()?;
+    let stats = store.stats()?;
+
+    println!("Nermo Store\n");
+    println!("Location:\n{}\n", stats.location.display());
+    println!("Packages:          {}", stats.package_names);
+    println!("Package versions:  {}", stats.package_versions);
+    println!("Disk usage:        {}", format_bytes(stats.disk_usage_bytes));
+    println!("\nProjects tracked:  {}", stats.projects_tracked);
+    Ok(())
+}
+
+fn store_prune(dry_run: bool, yes: bool) -> Result<()> {
+    let store = store::Store::open()?;
+    let mut unused = store.unused_packages()?;
+    unused.sort();
+
+    println!("Nermo Store Cleanup\n");
+    if unused.is_empty() {
+        println!("No unused packages found.");
+        return Ok(());
+    }
+
+    let mut total_bytes = 0u64;
+    for (name, version) in &unused {
+        total_bytes += store.package_disk_usage(name, version).unwrap_or(0);
+    }
+
+    println!("Unused packages: {}", unused.len());
+    println!("Potential space recovery: {}\n", format_bytes(total_bytes));
+    for (name, version) in &unused {
+        println!("  {name}@{version}");
+    }
+
+    if dry_run {
+        println!("\n(dry run — nothing removed)");
+        return Ok(());
+    }
+
+    if !yes {
+        print!("\nProceed? [y/N] ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let mut freed = 0u64;
+    for (name, version) in &unused {
+        freed += store.remove_package(name, version)?;
+    }
+    println!("\nRemoved {} packages, freed {}.", unused.len(), format_bytes(freed));
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
