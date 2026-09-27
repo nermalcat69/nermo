@@ -529,3 +529,129 @@ graph. Fully closing that gap would mean replicating substantially more of
 real npm/yarn/pnpm's hoisting and dedup-preference algorithm, which is one
 of the most heavily-engineered, complex parts of any real package manager
 — a legitimately larger undertaking than this fix, not attempted here.
+
+## Update — found and fixed the real byte-gap cause: optionalDependencies override was ignored
+
+A cold-install run on the real ~480-package project showed nermo pulling
+*more* bytes than before the dedup fix should have allowed: 475 packages /
+364.5MB vs bun's 462 packages / 266.9MB (a ~1.37x byte gap, worse than the
+~1.23x measured earlier). Diffing the actual resolved package sets (not
+just counts — bun's own lockfile lists every optionalDependencies platform
+variant for reproducibility even though it only *installs* the matching
+one, so raw lockfile entry counts aren't comparable) found the real cause:
+nermo had downloaded all 22 platform binaries of `esbuild@0.18.20`
+(`@esbuild/linux-arm64`, `@esbuild/win32-x64`, ... every OS/arch), not just
+`@esbuild/darwin-arm64`.
+
+Checked esbuild@0.18.20's actual npm registry metadata directly
+(`registry.npmjs.org/esbuild/0.18.20`): it lists every platform package in
+**both** `dependencies` and `optionalDependencies` simultaneously. Per npm
+semantics, an `optionalDependencies` entry overrides a same-named
+`dependencies` entry — but `resolver.rs`'s `resolve_one` was building edges
+from both maps independently with no exclusion, so every platform binary
+also got a `DepEdge::Required` edge that bypassed the platform filter in
+`resolve_optional` entirely and downloaded unconditionally.
+
+Fix: exclude any name from the `dependencies` edge list if it also appears
+in `optionalDependencies` (`resolver.rs`, `resolve_one`).
+
+Real result, same project, real bytes via `netstat -ib`, real wall time,
+fresh empty store both times:
+
+| | before fix | after fix | bun |
+|---|---|---|---|
+| Packages downloaded | 475 | 454 | 462 |
+| Bytes downloaded | 364.5MB | 228.5MB | 266.9MB |
+| Cold install wall time | 75.5s | 49.2s | 61.6s |
+
+nermo now transfers **fewer bytes than bun** and completes cold installs
+**faster than bun** on this project — the entire byte/time gap chased
+across this session turned out to be one platform-filtering correctness
+bug, not a fundamental network or architecture disadvantage.
+
+Also ran the two other scenarios recommended alongside this fix, same
+project, same populated store/cache:
+
+| Scenario | nermo | bun |
+|---|---|---|
+| Cold (empty store/cache) | 49.2s | 61.6s |
+| Warm store, no `node_modules` | 1.96s | 3.54s |
+| No-op (already installed, unchanged) | ~14ms | ~35-40ms |
+
+The no-op number also reflects the `Linker::place_link` fix from this same
+round (skip remove+recreate when an existing symlink already points at the
+correct target) — link time for a true no-op dropped from ~1.95s (a full
+node_modules rebuild) to single-digit milliseconds.
+
+Each number above is a single real run, not yet a 5-run median as ideal
+benchmarking practice would want — noted here for anyone re-verifying, not
+papered over.
+
+## Update — tried parallelizing the link phase; no real win, reverted
+
+Tried running `ensure_virtual_entry`/`place_link` across packages
+concurrently via the same `parallel_for_each` helper the resolver already
+uses, at concurrency 4/8/16/32/64. Result: noisy 1.7-2.9s range with no
+consistent improvement over the sequential ~1.96s baseline, and *worse* at
+higher concurrency — the same lesson as the earlier resolver-concurrency
+test: this workload's cost is filesystem/journal I/O, not CPU-parallelizable
+work. Reverted to sequential rather than keep unhelpful complexity.
+
+## Update — found the real warm-install bottleneck: syscall count, fixed with clonefile()
+
+The link phase for the real project does ~30,000 individual `fs::hard_link`
+calls plus a matching number of `walkdir` `lstat`s (454 packages, 29,843
+files across the store). That syscall volume — not code structure — was
+the actual ~2s cost; this is also why parallelizing it didn't help, since
+concurrent threads don't reduce total syscalls and APFS appears to
+serialize much of this at the journal level regardless of thread count.
+
+Also found and removed one genuinely redundant syscall along the way:
+`hardlink_tree`'s file branch called `fs::create_dir_all(parent)` for every
+single file, even though `WalkDir`'s default top-down order guarantees the
+parent directory's own entry (which creates it) is always visited first.
+Measured effect alone: negligible (~2.0s -> ~1.95s) — not the real cost,
+but genuinely dead work, so kept the removal.
+
+The real fix: macOS/APFS has `clonefile()` (what `cp -c` uses under the
+hood) — one syscall clones an entire directory tree copy-on-write, at zero
+extra disk cost (same guarantee a hardlink already gives), independent of
+file count. Added `try_clonefile` (`linker.rs`), a small `unsafe extern
+"C"` binding — no new crate; `clonefile()` isn't in std but is one function
+in libSystem — gated `#[cfg(target_os = "macos")]` with a `false`-returning
+stub elsewhere so `hardlink_tree` remains the deliberate fallback on
+Linux/Windows and for any clonefile failure (e.g. crossing a filesystem
+boundary). `ensure_virtual_entry` now tries `try_clonefile` first and only
+falls back to the walk+hardlink loop if it returns false; the store's own
+completion-marker file (which `hardlink_tree` deliberately excludes) is
+removed after a successful clone since clonefile copies everything.
+
+Verified this isn't a benchmarking artifact of the kind caught earlier this
+session (forking one process per *file* measures fork overhead, not real
+cost): measured `clonefile()` two ways before touching any Rust code —
+subprocess-per-*package* (233 calls to `cp -c`, matching one call per
+virtual-store entry) took 1.81s, barely better than baseline, because
+233 forks still costs real time; a raw `clonefile()` syscall in-process via
+Python `ctypes` (no fork at all) for the same 233 real packages took
+0.19s. The in-process number is what the Rust implementation actually gets,
+since it's a direct FFI call with no subprocess involved.
+
+Real result, same project, real timed runs, store pre-populated
+(warm-store scenario: populated store, no `node_modules`):
+
+| | before | after | bun |
+|---|---|---|---|
+| Link phase | ~1.95s | ~270-340ms | — |
+| Total warm-store install | ~1.96s | ~0.28s (steady state) | 3.54s |
+
+Verified correctness, not just speed: diffed a cloned virtual entry's
+`package.json` byte-for-byte against the store original (identical),
+confirmed permissions still read-only (0444, same as the pre-existing
+hardlink path — clonefile preserves source attributes, so no regression
+there), and confirmed a real `node -e "require(...)"` resolves a
+leaf-package symlink nested three levels down
+(`@react-router/dev` -> `lodash`) to working, correct content.
+
+Cold-install and no-op numbers are unaffected by this change (cold is
+download-bound, no-op already skips `ensure_virtual_entry` entirely via
+the marker check) — confirmed no-op still completes in ~25ms.

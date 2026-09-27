@@ -244,8 +244,20 @@ impl<'a> Resolver<'a> {
         }
 
         let vmeta = meta.versions[&version].clone();
+        // npm semantics: a name present in both `dependencies` and
+        // `optionalDependencies` is optional — the optional entry overrides
+        // the dependencies one. esbuild@0.18.20's platform binaries are
+        // published exactly this way; without this exclusion every
+        // platform's binary was pulled in as a hard "required" edge,
+        // bypassing the platform filter in `resolve_optional` entirely.
         let mut items: Vec<DepEdge> = Vec::with_capacity(vmeta.dependencies.len() + vmeta.optional_dependencies.len());
-        items.extend(vmeta.dependencies.iter().map(|(n, r)| DepEdge::Required(n.clone(), r.clone())));
+        items.extend(
+            vmeta
+                .dependencies
+                .iter()
+                .filter(|(n, _)| !vmeta.optional_dependencies.contains_key(*n))
+                .map(|(n, r)| DepEdge::Required(n.clone(), r.clone())),
+        );
         items.extend(vmeta.optional_dependencies.iter().map(|(n, r)| DepEdge::Optional(n.clone(), r.clone())));
         let edges = self.fan_out(&items)?;
 
