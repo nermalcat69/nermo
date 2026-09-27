@@ -371,3 +371,58 @@ from an honest test is worth as much as a positive one: it rules out a
 plausible-sounding lever so it doesn't get re-attempted without new
 information, and it's evidence the redundant-fetch fix above was verified
 the same way — by measuring, not assuming.
+
+## Update — three more hypotheses tested; one kept, two ruled out
+
+Chasing further improvement on the real 480-package project (store phase:
+896MB downloaded in ~52s). Tested three ideas, in order:
+
+**1. Raise download concurrency further.** Already tested and ruled out in
+an earlier phase (16 vs 48: no measurable difference) — re-confirmed here,
+not re-litigated.
+
+**2. Parallel range-request chunking for large files.** Hypothesis: a
+single-connection download of a 36MB tarball only achieved 4.6 MB/s, well
+below typical broadband, suggesting a per-connection cap that splitting
+across multiple connections could beat. Tested directly: 4 parallel
+range-chunked connections for the same file took **35s vs 7.3s for a single
+connection** — dramatically worse — and the reassembled file didn't even
+match the original, because npm's registry redirects to a CDN and a naive
+`curl -r` range request doesn't survive that redirect correctly. Ruled out;
+not worth building.
+
+Separately, the math argues against a per-connection cap being the real
+constraint anyway: 896MB in 52s at 16-way concurrency is ~17.2 MB/s
+aggregate — only ~3.7x the single-connection rate, not ~16x. That's the
+signature of an aggregate bandwidth ceiling (this network's real capacity to
+`registry.npmjs.org` at the time of testing), not a per-connection limit —
+no amount of added parallelism inside nermo can beat a ceiling that isn't
+there because of nermo.
+
+**3. Skip the full metadata document for optionalDependencies platform
+checks.** `Resolver::resolve_optional` was fetching the *full* multi-version
+package document (`Resolver::metadata`) just to check one exact pinned
+version's `os`/`cpu` fields — for a project with ~20 platform-sibling
+packages per native tool (esbuild, sharp, lightningcss, workerd), of which
+only one is ever a match, that's the full document for every one of the ~19
+rejected candidates. Confirmed the size difference before writing code:
+`@esbuild/darwin-arm64`'s full document is 106,747 bytes; the single version
+actually needed is 1,795 bytes — 59x smaller. Since platform-variant
+optional dependencies are always pinned to an exact version, switched that
+path to the small single-version endpoint (falling back to the full
+document only for the rare non-exact range).
+
+Kept — real, reproducible improvement, confirmed with two separate runs:
+
+| | resolve phase |
+|---|---|
+| before | 43.2s |
+| **after** | **38.75s, 38.86s** (two runs) |
+
+A genuine ~10% cut, smaller than the 59x payload reduction might suggest —
+consistent with round-trip *latency*, not payload *size*, being the
+remaining dominant cost per request (the same conclusion the abbreviated-
+metadata-format fix pointed to earlier in this document). Total install time
+on this project is still dominated by the store phase's bandwidth ceiling
+(§2 above), which is a property of the network, not something further
+software changes here can fix.

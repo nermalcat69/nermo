@@ -251,7 +251,20 @@ impl<'a> Resolver<'a> {
     /// rather than a broken graph.
     fn resolve_optional(&self, local_name: &str, range: &str) -> Option<PackageKey> {
         let (name, real_range) = Self::resolve_alias(local_name, range);
-        let applies_here = {
+
+        // Platform-variant optional dependencies are always pinned to an
+        // exact version (npm generates them alongside their parent, one per
+        // OS/CPU). For that overwhelmingly common case, check os/cpu via the
+        // small single-version endpoint instead of the full multi-version
+        // document — a real project can have ~20 platform siblings per
+        // native package family, of which only one is ever a match, so this
+        // is the difference between one ~2KB request and one ~100KB+ request
+        // for every candidate that gets rejected. Falls back to the full
+        // document only for the rare non-exact range.
+        let applies_here = if let Ok(version) = Version::parse(&real_range) {
+            let vmeta = self.client.version_metadata(&name, &version.to_string()).ok()?;
+            platform_matches(&vmeta.os, current_os()) && platform_matches(&vmeta.cpu, current_cpu())
+        } else {
             let meta = self.metadata(&name).ok()?;
             let version = pick_version(&name, &real_range, &meta).ok()?;
             let vmeta = &meta.versions[&version];
