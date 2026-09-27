@@ -1,10 +1,10 @@
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionMetadata {
     pub name: String,
     pub version: String,
@@ -25,7 +25,7 @@ pub struct VersionMetadata {
     pub cpu: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dist {
     pub tarball: String,
     /// "<algo>-<base64>", e.g. "sha512-abcd...". Older packages may lack this
@@ -37,7 +37,7 @@ pub struct Dist {
 /// The full package document: every published version and its metadata.
 /// Needed by the resolver, which must see all versions to pick the best one
 /// satisfying a range; the single-version endpoint isn't enough for that.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageMetadata {
     pub versions: BTreeMap<String, VersionMetadata>,
 }

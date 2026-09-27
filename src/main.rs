@@ -154,6 +154,7 @@ fn install(frozen: bool, prune: bool) -> Result<()> {
     }
 
     let client = registry::Client::new()?;
+    let store = store::Store::open()?;
     let existing_lock = lockfile::Lockfile::load(&root)?;
     let reusable_lock = existing_lock.as_ref().filter(|lock| lock.matches_manifest(&direct));
 
@@ -174,7 +175,12 @@ fn install(frozen: bool, prune: bool) -> Result<()> {
                 println!("\npackage.json has changed since the lockfile was written; not using it.");
             }
             println!("Resolving dependencies...");
-            let graph = resolver::Resolver::new(&client).resolve(&direct)?;
+            // The disk cache means a second project resolving a package
+            // another project already resolved recently skips the registry
+            // round trip entirely, not just the store/download step.
+            let graph = resolver::Resolver::new(&client)
+                .with_disk_cache(store.root().join("cache").join("registry"))
+                .resolve(&direct)?;
             let lock = lockfile::Lockfile::from_graph(&direct, &graph);
             (graph, Some(lock))
         }
@@ -195,7 +201,6 @@ fn install(frozen: bool, prune: bool) -> Result<()> {
     }
 
     println!("\nChecking global store...");
-    let store = store::Store::open()?;
     let keys: Vec<_> = graph.packages.keys().cloned().collect();
     let store_start = Instant::now();
     let downloaded = store.ensure_all(&client, &keys, install_concurrency())?;

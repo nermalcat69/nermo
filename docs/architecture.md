@@ -68,10 +68,17 @@ async/tokio — deliberately, since the PRD's own recommended-libraries list
 names Tokio but the actual workload (a CLI that runs, does I/O, and exits) is
 latency-bound, not concurrency-bound in a way that needs an async runtime.
 Where concurrency does help (parallel package downloads in
-`Store::ensure_all`), it's plain OS threads via `std::thread::scope` and the
+`Store::ensure_all`, and the resolver's per-node dependency fan-out in
+`Resolver::fan_out`), it's plain OS threads via `std::thread::scope` and the
 small `concurrency::parallel_for_each` helper — no new dependency, no
-executor to configure. See `docs/performance.md` for measurements and where
-this does *not* yet help (resolver metadata fetches are still sequential).
+executor to configure. The resolver also persists fetched registry metadata
+to `store/cache/registry/` (TTL-based, `Resolver::with_disk_cache`) so a
+second project resolving a shared package skips the registry round trip
+entirely, not just the store/download step. See `docs/performance.md` for
+measurements, including a case where raising concurrency further was tested
+and found *not* to help (the graph's depth, and the sheer count of
+platform-variant `optionalDependencies` fetches for native-heavy stacks, not
+per-node width, is what dominates cold-resolve time).
 
 ## What's intentionally not here yet
 

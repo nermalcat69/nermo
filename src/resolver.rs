@@ -2,8 +2,11 @@ use crate::concurrency::parallel_for_each;
 use crate::registry::{Client, PackageMetadata};
 use anyhow::{anyhow, Context, Result};
 use semver::{Version, VersionReq};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type PackageKey = (String, String);
 
@@ -24,6 +27,21 @@ pub struct DependencyEdge {
 /// once, mirrored per recursion level (see `Resolver::fan_out`) rather than
 /// globally — see the `ponytail:` note below.
 const CONCURRENCY: usize = 16;
+
+/// How long a persisted registry metadata document is trusted before a fresh
+/// resolve refetches it. Only matters for fresh resolution (no lockfile) —
+/// this is what makes a *second* project resolving `react` for the first
+/// time skip the network entirely instead of just skipping the store/download
+/// step. The trade-off is the same one every package manager's metadata
+/// cache makes: a version published in the last hour might not be seen by a
+/// brand-new resolve during that window.
+const METADATA_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Serialize, Deserialize)]
+struct DiskCacheEntry {
+    fetched_at_unix: u64,
+    metadata: PackageMetadata,
+}
 
 pub struct ResolvedPackage {
     pub tarball: String,
@@ -59,6 +77,7 @@ pub struct Resolver<'a> {
     client: &'a Client,
     metadata_cache: Mutex<HashMap<String, Arc<PackageMetadata>>>,
     packages: Mutex<BTreeMap<PackageKey, ResolvedPackage>>,
+    disk_cache_dir: Option<PathBuf>,
 }
 
 enum DepEdge {
@@ -68,7 +87,52 @@ enum DepEdge {
 
 impl<'a> Resolver<'a> {
     pub fn new(client: &'a Client) -> Self {
-        Self { client, metadata_cache: Mutex::new(HashMap::new()), packages: Mutex::new(BTreeMap::new()) }
+        Self {
+            client,
+            metadata_cache: Mutex::new(HashMap::new()),
+            packages: Mutex::new(BTreeMap::new()),
+            disk_cache_dir: None,
+        }
+    }
+
+    /// Enable a persistent, TTL-based on-disk cache of registry metadata
+    /// under `dir` (in practice `store/cache/registry/`). Without this, the
+    /// global store already dedupes downloaded *content* perfectly across
+    /// projects, but a second project resolving `react` for the first time
+    /// still pays a fresh network round trip for its metadata — this closes
+    /// that gap for the common "several projects share this package" case.
+    pub fn with_disk_cache(mut self, dir: PathBuf) -> Self {
+        self.disk_cache_dir = Some(dir);
+        self
+    }
+
+    fn disk_cache_path(&self, name: &str) -> Option<PathBuf> {
+        self.disk_cache_dir.as_ref().map(|dir| dir.join(format!("{}.json", name.replace('/', "+"))))
+    }
+
+    fn read_disk_cache(&self, name: &str) -> Option<PackageMetadata> {
+        let path = self.disk_cache_path(name)?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let entry: DiskCacheEntry = serde_json::from_str(&text).ok()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        if now.saturating_sub(entry.fetched_at_unix) > METADATA_CACHE_TTL.as_secs() {
+            return None;
+        }
+        Some(entry.metadata)
+    }
+
+    /// Best-effort: a failure to persist the cache should never fail (or
+    /// even be noticed by) the resolve it's optimizing.
+    fn write_disk_cache(&self, name: &str, metadata: &PackageMetadata) {
+        let Some(path) = self.disk_cache_path(name) else { return };
+        let Some(dir) = path.parent() else { return };
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        if let Ok(json) = serde_json::to_string(&DiskCacheEntry { fetched_at_unix: now, metadata: metadata.clone() }) {
+            let _ = std::fs::write(&path, json);
+        }
     }
 
     /// Resolve a project's direct dependencies into a complete graph,
@@ -100,10 +164,19 @@ impl<'a> Resolver<'a> {
         if let Some(cached) = self.metadata_cache.lock().unwrap().get(name) {
             return Ok(cached.clone());
         }
+
+        if let Some(disk_cached) = self.read_disk_cache(name) {
+            let arc = Arc::new(disk_cached);
+            let mut cache = self.metadata_cache.lock().unwrap();
+            return Ok(cache.entry(name.to_string()).or_insert(arc).clone());
+        }
+
         // Fetched outside the lock: a duplicate concurrent fetch for the
         // same name is possible (harmless, just wasted bandwidth) but never
         // blocks unrelated names behind one slow request.
-        let fetched = Arc::new(self.client.package_metadata(name).with_context(|| format!("resolving {name}"))?);
+        let fetched = self.client.package_metadata(name).with_context(|| format!("resolving {name}"))?;
+        self.write_disk_cache(name, &fetched);
+        let fetched = Arc::new(fetched);
         let mut cache = self.metadata_cache.lock().unwrap();
         Ok(cache.entry(name.to_string()).or_insert(fetched).clone())
     }
@@ -299,6 +372,48 @@ mod tests {
     fn exact_version_is_preferred_verbatim() {
         let meta = fake_metadata(&["1.0.0", "1.2.0"]);
         assert_eq!(pick_version("demo", "1.2.0", &meta).unwrap(), "1.2.0");
+    }
+
+    #[test]
+    fn disk_cache_roundtrips_a_fresh_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::new().unwrap();
+        let resolver = Resolver::new(&client).with_disk_cache(dir.path().to_path_buf());
+
+        let meta = fake_metadata(&["1.0.0", "1.2.0"]);
+        resolver.write_disk_cache("demo", &meta);
+
+        let cached = resolver.read_disk_cache("demo").expect("fresh entry should be readable");
+        assert_eq!(cached.versions.keys().collect::<Vec<_>>(), meta.versions.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn disk_cache_ignores_stale_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::new().unwrap();
+        let resolver = Resolver::new(&client).with_disk_cache(dir.path().to_path_buf());
+
+        let meta = fake_metadata(&["1.0.0"]);
+        let stale_entry = DiskCacheEntry {
+            fetched_at_unix: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+                - METADATA_CACHE_TTL.as_secs()
+                - 1,
+            metadata: meta,
+        };
+        let path = resolver.disk_cache_path("demo").unwrap();
+        std::fs::write(&path, serde_json::to_string(&stale_entry).unwrap()).unwrap();
+
+        assert!(resolver.read_disk_cache("demo").is_none(), "an expired entry must not be trusted");
+    }
+
+    #[test]
+    fn disk_cache_path_is_scope_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::new().unwrap();
+        let resolver = Resolver::new(&client).with_disk_cache(dir.path().to_path_buf());
+        let path = resolver.disk_cache_path("@types/node").unwrap();
+        assert!(!path.to_string_lossy().contains('/') || path.starts_with(dir.path()));
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "@types+node.json");
     }
 
     #[test]

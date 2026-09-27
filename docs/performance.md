@@ -223,3 +223,77 @@ per-node fan-out width) plus 484 tarball downloads both take real time. This
 is real production data, not a synthetic benchmark, and it's the best
 evidence yet that the still-undone "parallelize/cache resolver metadata
 across the whole graph, not just per-node" lever matters at real-world scale.
+
+## Update — tested raising concurrency on the same real project; it didn't help
+
+The user reported the ~106s cold install (480 packages, a React Router +
+Cloudflare Workers stack: esbuild, sharp, lightningcss, wrangler/workerd)
+felt slow. Before touching anything, reproduced it on an isolated copy of
+their real `package.json` (108.52s, matching their 106.43s) and tested
+`NERMO_CONCURRENCY=48` against the default of 16:
+
+| Concurrency | resolve | store | total |
+|---|---|---|---|
+| 16 (default) | 46.14s | 56.27s | 108.52s |
+| 48 | 49.15s | 56.28s | 105.50s |
+
+No measurable difference — store phase is identical to the second decimal.
+**Raising concurrency was a plausible-sounding fix that turned out to be a
+red herring; the number was tested, not assumed, before writing it up.**
+
+Root cause instead: this stack is unusually heavy with native-binary
+tooling. esbuild, sharp, lightningcss, and `@cloudflare/workerd` each
+declare ~15-20 `optionalDependencies` (one per OS/CPU platform), and there's
+no npm registry API to ask "does this match my platform?" without fetching
+that candidate's full metadata first (`Resolver::resolve_optional` in
+`src/resolver.rs`). Those fetches already run concurrently per node — that's
+exactly why more concurrency didn't help, the graph's *width* at each node
+isn't the bottleneck, the sheer *count* of necessarily-wasted round trips
+is. There's no batch metadata API to eliminate this, and a name-pattern
+heuristic to skip likely-wrong-platform fetches without confirming via
+metadata was considered and rejected: it would trade a slow-but-correct
+install for a fast-but-possibly-silently-wrong one.
+
+What actually matters for this complaint: a second `install` of the exact
+same project (same lockfile, warm store) took **102ms**. The ~106s is a
+one-time cost paid when a dependency tree is first discovered fresh (new
+clone, deleted lockfile, or CI with no cache) — not the steady-state cost of
+working on the same checkout.
+
+## Update — persistent registry metadata cache (closes the flagged lever)
+
+Reviewing `bun.md` (a research document comparing Bun's install architecture)
+alongside the concurrency investigation above surfaced the actual gap: the
+global store already dedupes downloaded *content* perfectly across
+projects — verified repeatedly (`store::tests::old_versions_become_unused_*`,
+the multi-project `commander`/`next` runs in earlier sessions) — but it
+didn't dedupe the *metadata lookup*. A second project resolving `react` for
+the first time (no lockfile of its own yet) still paid a full registry round
+trip, even though a sibling project had fetched that exact document minutes
+earlier. This is the "persistent on-disk metadata cache" flagged as the next
+lever in the sections above.
+
+Implemented as a TTL-based (1 hour) cache at `store/cache/registry/`,
+keyed by package name (`Resolver::with_disk_cache`, `src/resolver.rs`).
+Deliberately a full skip-the-network TTL cache, not ETag conditional-GET:
+ETag revalidation would still pay the full round-trip *latency* (which
+dominates over payload size per the abbreviated-metadata investigation
+above) just to save bandwidth on a 304 — it wouldn't actually make a second
+project's resolve faster. A TTL cache trades a narrow, well-precedented risk
+(a version published in the last hour might not be seen by a brand-new
+resolve during that window) for eliminating the round trip entirely. It
+only affects fresh resolution — a project with a matching lockfile never
+calls this at all.
+
+Verified live: two fresh projects (`a`, `b`), neither with a lockfile,
+both depending on `commander@^12.0.0`, against an initially empty store:
+
+```
+project a (first ever resolve): resolve 621ms, store 601ms
+project b (shares the dependency, resolved moments later): resolve 2ms, store 0ms
+```
+
+Confirmed the cache is real, not an in-memory fluke that would vanish
+between separate process invocations: `store/cache/registry/commander.json`
+exists on disk with the full 124-version metadata document and a
+`fetched_at_unix` timestamp.
