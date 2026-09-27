@@ -86,10 +86,25 @@ impl Client {
         resp.json().with_context(|| format!("parsing metadata for {name}@{version}"))
     }
 
-    /// Fetch the full package document (every published version).
+    /// Fetch the package document listing every published version.
+    ///
+    /// Requests npm's "abbreviated" metadata format (the same one npm/pnpm
+    /// use for installs) instead of the default full document. For a
+    /// long-lived, popular package like `@types/node` the full document is
+    /// over 11MB (every version's readme, full dependency history, etc.);
+    /// the abbreviated one is ~2MB and still has everything the resolver
+    /// needs (name, version, dependencies, optionalDependencies, os, cpu,
+    /// dist). On a slow connection the full document was enough to time out
+    /// requests outright — this is a real fix for that, not just a bigger
+    /// timeout number.
     pub fn package_metadata(&self, name: &str) -> Result<PackageMetadata> {
         let url = format!("{}/{}", self.registry, encode_name(name));
-        let resp = self.http.get(&url).send().with_context(|| format!("requesting {url}"))?;
+        let resp = self
+            .http
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/vnd.npm.install-v1+json")
+            .send()
+            .with_context(|| format!("requesting {url}"))?;
         if !resp.status().is_success() {
             bail!("registry returned {} for {name}", resp.status());
         }
