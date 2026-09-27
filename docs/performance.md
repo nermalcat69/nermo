@@ -318,3 +318,56 @@ Node, not just that the links exist: `require('left-pad')` (shortcut
 straight to the store) and `require('debug')` (virtual store, whose own
 `require('ms')` needs its own `node_modules`) both resolve correctly from
 the same install.
+
+## Update — eliminated a redundant metadata fetch per downloaded package
+
+`Store::ensure` was calling `client.version_metadata(name, version)` — a
+separate registry request — for every package it downloaded, even though
+the resolver had *already* fetched that exact package's `tarball`/
+`integrity`/`shasum` moments earlier and it was sitting unused in
+`ResolvedPackage`. `ensure`/`ensure_all` now take the already-known `Dist`
+directly (as a lazy closure, so `nermo fetch`'s ad-hoc lookups — which have
+no resolved graph to draw from — still fetch metadata, but only on an
+actual cache miss).
+
+Real, repeated (3 runs each, fresh store/cache every time) cold-install
+comparison against `bun`, same manifest (`yargs@^17.7.2`, 16 packages):
+
+| | run 1 | run 2 | run 3 | avg |
+|---|---|---|---|---|
+| nermo, before this fix | — | — | — | 2.69s (single sample) |
+| **nermo, after this fix** | 1.17s | 1.17s | 1.13s | **1.16s** |
+| bun | 2.29s | 1.34s | 2.14s | 1.92s |
+
+Store phase alone: 1.42s → 149ms. On a small-to-medium dependency tree
+(round-trip count, not raw bytes, dominates), nermo now beats bun on cold
+installs in this comparison. This does **not** generalize to every project —
+see the next entry.
+
+## Update — pipelining resolve and download: tried, measured, reverted
+
+Hypothesis: since a package's tarball URL is known the moment it resolves
+(not after the whole graph finishes), overlapping download with ongoing
+resolution should let a large, download-bandwidth-heavy project (the real
+480-package project referenced throughout this doc) approach
+`max(resolve, store)` instead of `resolve + store`.
+
+Implemented it (a channel from the resolver to a pool of download workers,
+started the instant each package resolved). First version had a real bug —
+`while let Ok(x) = mutex.lock().unwrap().recv()` keeps the lock guard alive
+for the entire loop body, not just the check, which serialized all
+"concurrent" download workers into one and made the cold 480-package install
+**worse**: 195s vs a 98.8s baseline. Fixed the lock-scoping bug, re-measured:
+**102.08s — statistically a wash against the 98.82s baseline**, not the
+predicted improvement.
+
+Reverted rather than keep it. The likely reason it didn't help: this
+project's dominant cost is raw transfer bandwidth for a handful of huge
+native-binary tarballs (esbuild, sharp, workerd, lightningcss variants), and
+those aren't discovered early enough in resolution — behind expensive
+`optionalDependencies` platform exploration — to get meaningful overlap
+before resolution itself finishes. Recorded here because a negative result
+from an honest test is worth as much as a positive one: it rules out a
+plausible-sounding lever so it doesn't get re-attempted without new
+information, and it's evidence the redundant-fetch fix above was verified
+the same way — by measuring, not assuming.

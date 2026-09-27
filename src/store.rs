@@ -55,7 +55,20 @@ impl Store {
     /// Ensure `name@version` is present in the store, downloading and
     /// extracting it if necessary. Returns its path and whether it was
     /// already cached (a "reused" vs. "downloaded" package).
-    pub fn ensure(&self, client: &registry::Client, name: &str, version: &str) -> Result<(PathBuf, bool)> {
+    ///
+    /// `dist` is a closure, not an eager value, specifically so a caller
+    /// that already knows the tarball URL and integrity hash (the resolver
+    /// always does — it just fetched this exact package's metadata) pays
+    /// zero extra network cost, while a caller that doesn't (`nermo fetch`,
+    /// resolving an ad-hoc package with no graph behind it) only pays for a
+    /// registry lookup when the package isn't already cached.
+    pub fn ensure(
+        &self,
+        client: &registry::Client,
+        name: &str,
+        version: &str,
+        dist: impl FnOnce() -> Result<registry::Dist>,
+    ) -> Result<(PathBuf, bool)> {
         let dest = self.package_dir(name, version)?;
         if self.has_marker(&dest) {
             return Ok((dest, true));
@@ -66,13 +79,13 @@ impl Store {
             fs::remove_dir_all(&dest).with_context(|| format!("clearing stale partial install at {}", dest.display()))?;
         }
 
-        let meta = client.version_metadata(name, version)?;
-        let bytes = client.download_tarball(&meta.dist.tarball)?;
-        archive::verify(&bytes, &meta.dist)?;
+        let dist = dist()?;
+        let bytes = client.download_tarball(&dist.tarball)?;
+        archive::verify(&bytes, &dist)?;
 
         let tmp = tempfile::tempdir_in(self.root.join("temporary")).context("creating temp extraction dir")?;
         archive::extract(&bytes, tmp.path())?;
-        fs::write(tmp.path().join(COMPLETION_MARKER), meta.dist.integrity.as_deref().unwrap_or(""))
+        fs::write(tmp.path().join(COMPLETION_MARKER), dist.integrity.as_deref().unwrap_or(""))
             .context("writing completion marker")?;
         lock_permissions(tmp.path()).context("locking package contents read-only")?;
 
@@ -80,16 +93,23 @@ impl Store {
         Ok((dest, false))
     }
 
-    /// Ensure many packages are present, downloading missing ones
-    /// concurrently. A cold install spends almost all of its time waiting on
-    /// round trips to the registry, not CPU, so this is the single biggest
-    /// lever for install speed (PRD §15.1/§15.3). `ensure`'s own commit logic
-    /// is already race-safe (Phase 3), so no additional locking is needed to
-    /// run it from multiple threads.
-    pub fn ensure_all(&self, client: &registry::Client, keys: &[PackageKey], concurrency: usize) -> Result<usize> {
+    /// Ensure many already-resolved packages are present, downloading
+    /// missing ones concurrently. A cold install spends almost all of its
+    /// time waiting on round trips to the registry, not CPU, so this is one
+    /// of the biggest levers for install speed (PRD §15.1/§15.3). `ensure`'s
+    /// own commit logic is already race-safe (Phase 3), so no additional
+    /// locking is needed to run it from multiple threads. Each entry already
+    /// carries its resolved `Dist`, so this makes zero metadata requests —
+    /// only tarball downloads for whatever isn't already cached.
+    pub fn ensure_all(
+        &self,
+        client: &registry::Client,
+        packages: &[(PackageKey, registry::Dist)],
+        concurrency: usize,
+    ) -> Result<usize> {
         let downloaded = std::sync::atomic::AtomicUsize::new(0);
-        crate::concurrency::parallel_for_each(keys, concurrency, |(name, version)| {
-            let (_, reused) = self.ensure(client, name, version)?;
+        crate::concurrency::parallel_for_each(packages, concurrency, |((name, version), dist)| {
+            let (_, reused) = self.ensure(client, name, version, || Ok(dist.clone()))?;
             if !reused {
                 downloaded.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }

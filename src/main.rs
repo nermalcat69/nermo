@@ -3,6 +3,7 @@ mod concurrency;
 mod linker;
 mod lockfile;
 mod manifest;
+mod progress;
 mod registry;
 mod resolver;
 mod selfupdate;
@@ -110,7 +111,7 @@ fn fetch(spec: &str) -> Result<()> {
 
     let client = registry::Client::new()?;
     let store = store::Store::open()?;
-    let (path, reused) = store.ensure(&client, name, version)?;
+    let (path, reused) = store.ensure(&client, name, version, || Ok(client.version_metadata(name, version)?.dist))?;
 
     if reused {
         println!("Already in store: {}", path.display());
@@ -180,13 +181,15 @@ fn install(frozen: bool, prune: bool, force: bool) -> Result<()> {
             if existing_lock.is_some() {
                 println!("\npackage.json has changed since the lockfile was written; not using it.");
             }
-            println!("Resolving dependencies...");
             // The disk cache means a second project resolving a package
             // another project already resolved recently skips the registry
             // round trip entirely, not just the store/download step.
+            let spinner = progress::Spinner::start("Resolving dependencies");
             let graph = resolver::Resolver::new(&client)
                 .with_disk_cache(store.root().join("cache").join("registry"))
-                .resolve(&direct)?;
+                .resolve(&direct);
+            spinner.stop();
+            let graph = graph?;
             let lock = lockfile::Lockfile::from_graph(&direct, &graph);
             (graph, Some(lock))
         }
@@ -206,16 +209,34 @@ fn install(frozen: bool, prune: bool, force: bool) -> Result<()> {
         }
     }
 
-    println!("\nChecking global store...");
-    let keys: Vec<_> = graph.packages.keys().cloned().collect();
+    // Every package here was just resolved, so its tarball URL and integrity
+    // hash are already known — passing them along means ensure_all makes
+    // zero metadata requests, only tarball downloads for what's missing.
+    let packages: Vec<_> = graph
+        .packages
+        .iter()
+        .map(|(key, pkg)| {
+            let dist = registry::Dist {
+                tarball: pkg.tarball.clone(),
+                integrity: pkg.integrity.clone(),
+                shasum: pkg.shasum.clone(),
+            };
+            (key.clone(), dist)
+        })
+        .collect();
     let store_start = Instant::now();
-    let downloaded = store.ensure_all(&client, &keys, install_concurrency())?;
+    let spinner = progress::Spinner::start("Checking global store");
+    let downloaded = store.ensure_all(&client, &packages, install_concurrency());
+    spinner.stop();
+    let downloaded = downloaded?;
     let store_elapsed = store_start.elapsed();
-    println!("Downloaded: {downloaded}, reused: {}", keys.len() - downloaded);
+    println!("Downloaded: {downloaded}, reused: {}", packages.len() - downloaded);
 
-    println!("\nLinking dependencies...");
     let link_start = Instant::now();
-    linker::Linker::new(&store, &root, force).link(&graph)?;
+    let spinner = progress::Spinner::start("Linking dependencies");
+    let link_result = linker::Linker::new(&store, &root, force).link(&graph);
+    spinner.stop();
+    link_result?;
     let link_elapsed = link_start.elapsed();
 
     if let Some(lock) = lock_to_write {
@@ -247,7 +268,7 @@ fn install(frozen: bool, prune: bool, force: bool) -> Result<()> {
     println!("\nInstallation completed.\n");
     println!("Packages: {}", graph.packages.len());
     println!("Downloaded: {downloaded}");
-    println!("Reused: {}", keys.len() - downloaded);
+    println!("Reused: {}", packages.len() - downloaded);
     println!(
         "Duration: {} (resolve {}, store {}, link {})",
         format_duration(install_start.elapsed()),
