@@ -39,7 +39,13 @@ nermo fetch react@19.0.0 # ensure one package version is in the store, without i
 nermo store               # show store stats (packages, disk usage, tracked projects)
 nermo store prune         # remove packages no tracked project references (supports --dry-run, --yes)
 nermo doctor              # diagnose store/registry/project/lockfile/symlink problems
+nermo upgrade             # download and install the latest release over the running binary
 ```
+
+Every command also does a cheap, cached (once per 24h), best-effort check
+for a newer release and prints a one-line notice to stderr if one exists —
+so you'll be told about updates without needing to remember to check, but
+`nermo upgrade` itself always stays an explicit, deliberate step.
 
 Projects keep an ordinary `package.json` and `node_modules` — nermo adds only
 an optional `.nermo-lock` (see `docs/lockfile.md`). Nothing nermo-specific is

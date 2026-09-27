@@ -5,6 +5,7 @@ mod lockfile;
 mod manifest;
 mod registry;
 mod resolver;
+mod selfupdate;
 mod store;
 
 use anyhow::{Context, Result};
@@ -52,6 +53,9 @@ enum Command {
     },
     /// Diagnose common configuration and installation problems.
     Doctor,
+    /// Download and install the latest nermo release in place of the
+    /// running binary.
+    Upgrade,
 }
 
 #[derive(Subcommand)]
@@ -69,14 +73,27 @@ enum StoreCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    let is_upgrade = matches!(cli.command, Command::Upgrade);
+
+    let result = match cli.command {
         Command::Install { frozen, prune } => install(frozen, prune),
         Command::Fetch { spec } => fetch(&spec),
         Command::Remove { names } => remove(&names),
         Command::Store { action: None } => store_stats(),
         Command::Store { action: Some(StoreCommand::Prune { dry_run, yes }) } => store_prune(dry_run, yes),
         Command::Doctor => doctor(),
+        Command::Upgrade => selfupdate::upgrade(),
+    };
+
+    // Runs on every command except `upgrade` itself: a cheap, cached,
+    // best-effort check (see selfupdate::notify_if_update_available) so a
+    // newer release surfaces on its own instead of requiring the user to
+    // remember to check. Never affects this command's own exit code.
+    if !is_upgrade {
+        selfupdate::notify_if_update_available();
     }
+
+    result
 }
 
 fn fetch(spec: &str) -> Result<()> {
