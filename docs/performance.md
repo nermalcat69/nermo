@@ -297,3 +297,24 @@ Confirmed the cache is real, not an in-memory fluke that would vanish
 between separate process invocations: `store/cache/registry/commander.json`
 exists on disk with the full 124-version metadata document and a
 `fetched_at_unix` timestamp.
+
+## Update — leaf-package shortcut (link-phase speedup)
+
+`Linker::link_target` (`src/linker.rs`): a package with zero dependencies of
+its own can never hit the realpath problem that requires the hardlinked
+`.nermo/` virtual store (see `docs/architecture.md`), so it now gets a
+direct symlink straight into the global store instead. On the real
+480-package project, exactly half the graph (244/480, checked against its
+`.nermo-lock`) qualifies.
+
+| | before | after |
+|---|---|---|
+| link phase, 480 packages, cold | ~6-8s | **2.26s** |
+
+No change to disk usage (hardlinks already cost zero extra bytes either
+way) or to resolve/store phase time — this only reduces the number of
+per-file hardlink operations during linking. Verified correctness with real
+Node, not just that the links exist: `require('left-pad')` (shortcut
+straight to the store) and `require('debug')` (virtual store, whose own
+`require('ms')` needs its own `node_modules`) both resolve correctly from
+the same install.

@@ -46,16 +46,25 @@ package.json ──> manifest::load
 ## Why the linker hardlinks instead of symlinking whole packages
 
 The obvious approach — `node_modules/react -> store/packages/react/19.0.0`
-— is wrong. Node resolves a symlinked file to its real path *before*
-computing where to search for that module's own `node_modules`, so anything
-`react` itself `require()`s would search inside the immutable, dependency-free
-store instead of the project. `linker.rs` instead builds a private "virtual
-store" per resolved `(name, version)` under `node_modules/.nermo/`,
-populating it with hardlinks (which have no separate "real" location, unlike
-symlinks) of the package's own files, plus its own `node_modules` of
-*directory* symlinks to its dependencies' virtual entries. This is the same
-scheme pnpm uses, and the PRD names pnpm's store/symlink layout as a direct
-inspiration (§1.4).
+— is wrong *for a package that has its own dependencies*. Node resolves a
+symlinked file to its real path *before* computing where to search for that
+module's own `node_modules`, so anything `react` itself `require()`s would
+search inside the immutable, dependency-free store instead of the project.
+`linker.rs` builds a private "virtual store" per such resolved
+`(name, version)` under `node_modules/.nermo/`, populating it with hardlinks
+(which have no separate "real" location, unlike symlinks) of the package's
+own files, plus its own `node_modules` of *directory* symlinks to its
+dependencies' virtual entries. This is the same scheme pnpm uses, and the
+PRD names pnpm's store/symlink layout as a direct inspiration (§1.4).
+
+A **leaf package** (no dependencies of its own — `link_target` in
+`linker.rs`, commonly close to half of a real project's graph) has no
+internal `require()` that could hit this problem, so it skips the virtual
+store entirely and gets the "obvious approach" symlink straight to the
+store. This doesn't change disk usage (hardlinks already cost nothing extra)
+but does skip walking and hardlinking every file in roughly half the graph —
+measured as a ~3x reduction in link-phase time on a real 480-package
+project (see `docs/performance.md`).
 
 Store files are locked read-only (0o444) at commit time specifically so
 hardlinking them into multiple projects can't let one project's build tool

@@ -1,4 +1,4 @@
-use crate::resolver::{Graph, PackageKey};
+use crate::resolver::{Graph, PackageKey, ResolvedPackage};
 use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
@@ -11,16 +11,24 @@ const ENTRY_MARKER: &str = ".nermo-linked";
 
 /// Links a resolved dependency graph into a project's `node_modules`.
 ///
-/// Packages are never symlinked directly from the global store: Node
-/// resolves a symlinked file to its real path before it looks for that
-/// module's own `node_modules`, so a plain `node_modules/react -> store/...`
-/// symlink would make `react`'s internal `require()`s search the immutable,
-/// dependency-free store instead of the project. Instead, each resolved
-/// (name, version) gets a private "virtual store" directory under
+/// A package *with its own dependencies* is never symlinked directly from
+/// the global store: Node resolves a symlinked file to its real path before
+/// it looks for that module's own `node_modules`, so a plain
+/// `node_modules/react -> store/...` symlink would make `react`'s internal
+/// `require()`s search the immutable, dependency-free store instead of the
+/// project. Such packages get a private "virtual store" directory under
 /// `node_modules/.nermo/`, populated by *hardlinking* the package's files
 /// (hardlinks have no separate "real" location, so this sidesteps the
 /// realpath issue) plus its own `node_modules` full of directory symlinks to
 /// its dependencies' virtual entries. This is the same scheme pnpm uses.
+///
+/// A **leaf package** (no dependencies of its own — commonly ~half a real
+/// project's graph) has no internal `require()` that could hit this problem,
+/// so it skips the virtual-store entry entirely and gets a direct symlink
+/// straight to its store directory (`link_target`). This changes nothing
+/// about disk usage (hardlinks already cost zero extra bytes either way) —
+/// it just avoids walking and hardlinking every file in ~half the graph
+/// during linking.
 pub struct Linker<'a> {
     store: &'a Store,
     node_modules: PathBuf,
@@ -41,22 +49,40 @@ impl<'a> Linker<'a> {
     pub fn link(&self, graph: &Graph) -> Result<()> {
         fs::create_dir_all(self.virtual_root()).context("creating node_modules/.nermo")?;
 
-        for key in graph.packages.keys() {
-            self.ensure_virtual_entry(key)?;
+        for (key, pkg) in &graph.packages {
+            if !pkg.dependencies.is_empty() {
+                self.ensure_virtual_entry(key)?;
+            }
         }
         for (key, pkg) in &graph.packages {
+            if pkg.dependencies.is_empty() {
+                continue; // a leaf has no dependencies to link into an own node_modules
+            }
             let own_node_modules = self.virtual_entry_dir(key).join("node_modules");
             fs::create_dir_all(&own_node_modules)?;
             for edge in &pkg.dependencies {
-                self.place_link(&own_node_modules, &edge.local_name, &self.virtual_entry_dir(&edge.key))?;
+                let target = self.link_target(&edge.key, &graph.packages[&edge.key])?;
+                self.place_link(&own_node_modules, &edge.local_name, &target)?;
             }
         }
         let wanted: BTreeSet<&str> = graph.roots.iter().map(|edge| edge.local_name.as_str()).collect();
         for edge in &graph.roots {
-            self.place_link(&self.node_modules, &edge.local_name, &self.virtual_entry_dir(&edge.key))?;
+            let target = self.link_target(&edge.key, &graph.packages[&edge.key])?;
+            self.place_link(&self.node_modules, &edge.local_name, &target)?;
         }
         self.remove_obsolete_root_links(&wanted)?;
         Ok(())
+    }
+
+    /// Where a link to `key` should point: straight at the store for a leaf
+    /// package (see the doc comment above), or at its hardlinked virtual
+    /// entry otherwise.
+    fn link_target(&self, key: &PackageKey, pkg: &ResolvedPackage) -> Result<PathBuf> {
+        if pkg.dependencies.is_empty() {
+            self.store.package_dir(&key.0, &key.1)
+        } else {
+            Ok(self.virtual_entry_dir(key))
+        }
     }
 
     /// Remove top-level `node_modules` entries for packages no longer in
@@ -218,6 +244,39 @@ mod tests {
         let encoded = encode_entry(&key);
         assert_eq!(encoded, "@types+node@22.0.0");
         assert!(!encoded.contains('/'));
+    }
+
+    #[test]
+    fn leaf_packages_link_straight_to_the_store() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::for_test(store_root.path());
+        let linker = Linker { store: &store, node_modules: PathBuf::from("/project/node_modules"), force: false };
+
+        let leaf_key = ("left-pad".to_string(), "1.3.0".to_string());
+        let leaf = ResolvedPackage { tarball: String::new(), integrity: None, shasum: None, dependencies: vec![] };
+        let target = linker.link_target(&leaf_key, &leaf).unwrap();
+        assert_eq!(target, store.package_dir("left-pad", "1.3.0").unwrap());
+    }
+
+    #[test]
+    fn non_leaf_packages_link_to_the_virtual_store_entry() {
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::for_test(store_root.path());
+        let linker = Linker { store: &store, node_modules: PathBuf::from("/project/node_modules"), force: false };
+
+        let key = ("debug".to_string(), "4.4.3".to_string());
+        let non_leaf = ResolvedPackage {
+            tarball: String::new(),
+            integrity: None,
+            shasum: None,
+            dependencies: vec![crate::resolver::DependencyEdge {
+                local_name: "ms".to_string(),
+                key: ("ms".to_string(), "2.1.3".to_string()),
+            }],
+        };
+        let target = linker.link_target(&key, &non_leaf).unwrap();
+        assert_eq!(target, linker.virtual_entry_dir(&key));
+        assert_ne!(target, store.package_dir("debug", "4.4.3").unwrap());
     }
 
     #[test]
