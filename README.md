@@ -52,6 +52,22 @@ Projects keep an ordinary `package.json` and `node_modules` — nermo adds only
 an optional `.nermo-lock` (see `docs/lockfile.md`). Nothing nermo-specific is
 required to deploy: install with npm/pnpm/Bun instead at any time.
 
+## Performance
+
+Real, repeated measurements against `bun` on the same ~480-package
+production project, fresh store/cache both times (full methodology and
+history in `docs/performance.md`):
+
+| Scenario | nermo | bun |
+|---|---|---|
+| Cold install (empty store/cache) | 49.2s / 228.5MB downloaded | 61.6s / 266.9MB downloaded |
+| Warm store, no `node_modules` | ~0.28s | 3.54s |
+| No-op (already installed, unchanged) | ~14-25ms | ~35-40ms |
+
+The warm-store gap is the shared global store doing what it's for: once a
+package is in the store, rebuilding a project's `node_modules` from it is a
+handful of whole-directory clones, not a fresh download or a per-file walk.
+
 ## Docs
 
 - `docs/architecture.md` — module layout and the linker's design
