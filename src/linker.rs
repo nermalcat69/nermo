@@ -383,10 +383,10 @@ mod tests {
 
         // A managed link to a package no longer wanted (e.g. `nermo remove left-pad`).
         let target = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(target.path(), node_modules.path().join("left-pad")).unwrap();
+        symlink_dir(target.path(), &node_modules.path().join("left-pad")).unwrap();
         // A managed scoped link, also no longer wanted.
         fs::create_dir_all(node_modules.path().join("@types")).unwrap();
-        std::os::unix::fs::symlink(target.path(), node_modules.path().join("@types/left-pad")).unwrap();
+        symlink_dir(target.path(), &node_modules.path().join("@types/left-pad")).unwrap();
         // An unmanaged real directory a user created by hand.
         fs::create_dir_all(node_modules.path().join("hand-rolled")).unwrap();
         fs::write(node_modules.path().join("hand-rolled/index.js"), "keep me").unwrap();
