@@ -24,11 +24,18 @@ const ENTRY_MARKER: &str = ".nermo-linked";
 pub struct Linker<'a> {
     store: &'a Store,
     node_modules: PathBuf,
+    /// When true, an unmanaged path where a link needs to go is removed
+    /// instead of aborting the install. Off by default: silently deleting
+    /// another tool's installed files is exactly the kind of thing PRD §6.6
+    /// ("must not silently modify... or remove files") warns against, so
+    /// this has to be an explicit, deliberate opt-in (`nermo install
+    /// --force`), not automatic recovery.
+    force: bool,
 }
 
 impl<'a> Linker<'a> {
-    pub fn new(store: &'a Store, project_root: &Path) -> Self {
-        Self { store, node_modules: project_root.join("node_modules") }
+    pub fn new(store: &'a Store, project_root: &Path, force: bool) -> Self {
+        Self { store, node_modules: project_root.join("node_modules"), force }
     }
 
     pub fn link(&self, graph: &Graph) -> Result<()> {
@@ -130,8 +137,16 @@ impl<'a> Linker<'a> {
             Ok(meta) if meta.file_type().is_symlink() => {
                 fs::remove_file(&link_path).with_context(|| format!("replacing stale link {}", link_path.display()))?;
             }
+            Ok(meta) if self.force => {
+                if meta.is_dir() {
+                    fs::remove_dir_all(&link_path)
+                } else {
+                    fs::remove_file(&link_path)
+                }
+                .with_context(|| format!("removing unmanaged path {} (--force)", link_path.display()))?;
+            }
             Ok(_) => bail!(
-                "refusing to overwrite unmanaged path at {}: remove it or move it aside first",
+                "refusing to overwrite unmanaged path at {}: remove it (or move it aside), or rerun with --force",
                 link_path.display()
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -231,7 +246,7 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let store_root = tempfile::tempdir().unwrap();
         let store = Store::for_test(store_root.path());
-        let linker = Linker { store: &store, node_modules: node_modules.path().to_path_buf() };
+        let linker = Linker { store: &store, node_modules: node_modules.path().to_path_buf(), force: false };
 
         let err = linker.place_link(node_modules.path(), "react", target.path()).unwrap_err();
         assert!(err.to_string().contains("unmanaged"));
@@ -239,11 +254,27 @@ mod tests {
     }
 
     #[test]
+    fn place_link_with_force_removes_unmanaged_directory() {
+        let node_modules = tempfile::tempdir().unwrap();
+        let unmanaged = node_modules.path().join("react");
+        fs::create_dir_all(&unmanaged).unwrap();
+        fs::write(unmanaged.join("index.js"), "bun-installed").unwrap();
+
+        let target = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::for_test(store_root.path());
+        let linker = Linker { store: &store, node_modules: node_modules.path().to_path_buf(), force: true };
+
+        linker.place_link(node_modules.path(), "react", target.path()).unwrap();
+        assert!(node_modules.path().join("react").is_symlink(), "forced link should replace the unmanaged directory");
+    }
+
+    #[test]
     fn remove_obsolete_root_links_only_touches_managed_symlinks() {
         let node_modules = tempfile::tempdir().unwrap();
         let store_root = tempfile::tempdir().unwrap();
         let store = Store::for_test(store_root.path());
-        let linker = Linker { store: &store, node_modules: node_modules.path().to_path_buf() };
+        let linker = Linker { store: &store, node_modules: node_modules.path().to_path_buf(), force: false };
 
         // A managed link to a package no longer wanted (e.g. `nermo remove left-pad`).
         let target = tempfile::tempdir().unwrap();

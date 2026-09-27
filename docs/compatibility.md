@@ -19,6 +19,15 @@ a native binary (`rolldown`'s platform-specific binding), and nested
 
 ## Known gaps
 
+- **Switching package managers on the same `node_modules` needs `--force`.**
+  `nermo install` refuses to overwrite anything it didn't create — a real
+  `bun install`/`npm install`/`pnpm install` leaves real directories where
+  nermo expects to place its own symlinks, and by default nermo reports the
+  conflict rather than silently deleting another tool's files (PRD §6.6).
+  Hit in practice switching between `bun install` and `nermo install` on the
+  same checkout. `nermo install --force` takes over conflicting unmanaged
+  paths deliberately; without it, `rm -rf node_modules` first works too, same
+  as switching between npm/pnpm/bun themselves requires.
 - **`.bin` shims aren't created.** `node_modules/.bin/vite` doesn't exist,
   so `npm run build` / `npm run dev` (which rely on `.bin` being on `PATH`)
   won't find the binary. Workaround used during testing: invoke the

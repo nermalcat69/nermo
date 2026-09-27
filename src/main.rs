@@ -33,6 +33,12 @@ enum Command {
         /// (e.g. an old `next` version left behind after an upgrade).
         #[arg(long)]
         prune: bool,
+        /// Overwrite unmanaged node_modules entries left by another package
+        /// manager (e.g. after switching from bun/npm/pnpm) instead of
+        /// refusing to touch them. Off by default: this deletes files nermo
+        /// didn't create.
+        #[arg(long)]
+        force: bool,
     },
     /// Ensure a package version is present in the global store, downloading
     /// it only if it isn't already cached (Phase 2 registry + Phase 3 store).
@@ -76,7 +82,7 @@ fn main() -> Result<()> {
     let is_upgrade = matches!(cli.command, Command::Upgrade);
 
     let result = match cli.command {
-        Command::Install { frozen, prune } => install(frozen, prune),
+        Command::Install { frozen, prune, force } => install(frozen, prune, force),
         Command::Fetch { spec } => fetch(&spec),
         Command::Remove { names } => remove(&names),
         Command::Store { action: None } => store_stats(),
@@ -134,10 +140,10 @@ fn remove(names: &[String]) -> Result<()> {
     // install() will naturally re-resolve, relink (dropping the removed
     // package's now-obsolete node_modules entry), and rewrite the lockfile.
     println!();
-    install(false, false)
+    install(false, false, false)
 }
 
-fn install(frozen: bool, prune: bool) -> Result<()> {
+fn install(frozen: bool, prune: bool, force: bool) -> Result<()> {
     let install_start = Instant::now();
     let cwd = env::current_dir()?;
     let root = manifest::find_project_root(&cwd)?;
@@ -209,7 +215,7 @@ fn install(frozen: bool, prune: bool) -> Result<()> {
 
     println!("\nLinking dependencies...");
     let link_start = Instant::now();
-    linker::Linker::new(&store, &root).link(&graph)?;
+    linker::Linker::new(&store, &root, force).link(&graph)?;
     let link_elapsed = link_start.elapsed();
 
     if let Some(lock) = lock_to_write {

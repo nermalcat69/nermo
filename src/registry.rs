@@ -1,8 +1,32 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
+
+/// Retry a network operation a bounded number of times with a short backoff.
+/// A resolve over hundreds of packages makes hundreds of HTTP requests; a
+/// single transient failure (a dropped HTTP/2 stream, a mid-transfer reset)
+/// shouldn't abort the whole thing when trying again a moment later usually
+/// just works. Not applied to `check_connectivity`, which is meant to fail
+/// fast for diagnostics, not paper over a real outage.
+fn with_retries<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = None;
+    for i in 0..MAX_ATTEMPTS {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if i + 1 < MAX_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(300 * u64::from(i + 1)));
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once"))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionMetadata {
@@ -86,12 +110,14 @@ impl Client {
     /// Uses the registry's abbreviated per-version endpoint rather than the
     /// full package document, since we don't need every published version.
     pub fn version_metadata(&self, name: &str, version: &str) -> Result<VersionMetadata> {
-        let url = format!("{}/{}/{}", self.registry, encode_name(name), version);
-        let resp = self.http.get(&url).send().with_context(|| format!("requesting {url}"))?;
-        if !resp.status().is_success() {
-            bail!("registry returned {} for {name}@{version}", resp.status());
-        }
-        resp.json().with_context(|| format!("parsing metadata for {name}@{version}"))
+        with_retries(|| {
+            let url = format!("{}/{}/{}", self.registry, encode_name(name), version);
+            let resp = self.http.get(&url).send().with_context(|| format!("requesting {url}"))?;
+            if !resp.status().is_success() {
+                bail!("registry returned {} for {name}@{version}", resp.status());
+            }
+            resp.json().with_context(|| format!("parsing metadata for {name}@{version}"))
+        })
     }
 
     /// Fetch the package document listing every published version.
@@ -106,30 +132,65 @@ impl Client {
     /// requests outright — this is a real fix for that, not just a bigger
     /// timeout number.
     pub fn package_metadata(&self, name: &str) -> Result<PackageMetadata> {
-        let url = format!("{}/{}", self.registry, encode_name(name));
-        let resp = self
-            .http
-            .get(&url)
-            .header(reqwest::header::ACCEPT, "application/vnd.npm.install-v1+json")
-            .send()
-            .with_context(|| format!("requesting {url}"))?;
-        if !resp.status().is_success() {
-            bail!("registry returned {} for {name}", resp.status());
-        }
-        resp.json().with_context(|| format!("parsing package metadata for {name}"))
+        with_retries(|| {
+            let url = format!("{}/{}", self.registry, encode_name(name));
+            let resp = self
+                .http
+                .get(&url)
+                .header(reqwest::header::ACCEPT, "application/vnd.npm.install-v1+json")
+                .send()
+                .with_context(|| format!("requesting {url}"))?;
+            if !resp.status().is_success() {
+                bail!("registry returned {} for {name}", resp.status());
+            }
+            resp.json().with_context(|| format!("parsing package metadata for {name}"))
+        })
     }
 
     /// Download a package tarball, following redirects (handled by the HTTP client).
     pub fn download_tarball(&self, url: &str) -> Result<Vec<u8>> {
-        let resp = self.http.get(url).send().with_context(|| format!("downloading {url}"))?;
-        if !resp.status().is_success() {
-            bail!("download failed with status {} for {url}", resp.status());
-        }
-        Ok(resp.bytes().with_context(|| format!("reading response body from {url}"))?.to_vec())
+        with_retries(|| {
+            let resp = self.http.get(url).send().with_context(|| format!("downloading {url}"))?;
+            if !resp.status().is_success() {
+                bail!("download failed with status {} for {url}", resp.status());
+            }
+            Ok(resp.bytes().with_context(|| format!("reading response body from {url}"))?.to_vec())
+        })
     }
 }
 
 /// Scoped packages (@scope/name) must have the slash percent-encoded in the URL path.
 fn encode_name(name: &str) -> String {
     name.replace('/', "%2f")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn with_retries_succeeds_after_transient_failures() {
+        let attempts = AtomicU32::new(0);
+        let result = with_retries(|| {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                bail!("transient failure {n}");
+            }
+            Ok(42)
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn with_retries_gives_up_after_max_attempts() {
+        let attempts = AtomicU32::new(0);
+        let result: Result<()> = with_retries(|| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            bail!("always fails")
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "should stop after the max, not retry forever");
+    }
 }

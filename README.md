@@ -34,6 +34,7 @@ cd your-project         # any project with a package.json
 nermo install            # resolve, download into the shared store, link node_modules
 nermo install --frozen   # require .nermo-lock to be present and up to date; never re-resolve
 nermo install --prune    # after installing, also free any store package no project uses anymore
+nermo install --force    # take over node_modules entries left by another package manager (bun/npm/pnpm)
 nermo remove react zod   # remove dependencies from package.json and reinstall to match
 nermo fetch react@19.0.0 # ensure one package version is in the store, without installing a project
 nermo store               # show store stats (packages, disk usage, tracked projects)
