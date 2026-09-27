@@ -4,9 +4,9 @@
 
 | Platform | Status |
 |---|---|
-| macOS | Tested throughout development (this machine): install, store, prune, linking, and a real Vite + React build all verified working. |
-| Linux | Not run on real Linux. The code paths that differ (XDG store paths, Unix symlinks, `chmod`-based store immutability) are all behind `cfg!(target_os = ...)`/`#[cfg(unix)]` and share the same code as macOS (both are `unix`), so they're expected to work, but "expected" isn't "tested." |
-| Windows | Not run. Known gap: `linker::symlink_dir` calls `std::os::windows::fs::symlink_dir` directly, which needs Developer Mode or admin rights on stock Windows. The PRD's suggested junction-based fallback (§11.6) isn't implemented. The store's read-only permission lock (`store::lock_permissions`) is also a no-op on non-Unix — nothing currently protects Windows store contents from accidental modification via a hardlink. |
+| macOS | Full hands-on testing throughout development (this machine): install, store, prune, remove, doctor, linking, and a real Vite + React build all verified working against the live npm registry. |
+| Linux | CI (`.github/workflows/ci.yml`) builds and runs the full unit test suite on `ubuntu-latest` for every push/PR — so it compiles and the logic that doesn't touch a real filesystem/registry end-to-end is verified. Nobody has run a real `nermo install` against a real project on Linux yet. The code paths that differ (XDG store paths, Unix symlinks, `chmod`-based store immutability) are all behind `#[cfg(unix)]` and share the same code as macOS, so a full integration pass is expected to work, not confirmed to. |
+| Windows | CI builds and runs the unit test suite on `windows-latest`, same caveat as Linux — compiles and unit-tests pass, no real end-to-end install has been run. Known gap: `linker::symlink_dir` calls `std::os::windows::fs::symlink_dir` directly, which needs Developer Mode or admin rights on stock Windows. The PRD's suggested junction-based fallback (§11.6) isn't implemented. The store's read-only permission lock (`store::lock_permissions`) is also a no-op on non-Unix — nothing currently protects Windows store contents from accidental modification via a hardlink. |
 
 ## What's been validated against a real project
 

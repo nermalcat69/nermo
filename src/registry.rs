@@ -51,9 +51,27 @@ impl Client {
     pub fn new() -> Result<Self> {
         let http = reqwest::blocking::Client::builder()
             .user_agent(concat!("nermo/", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("building HTTP client")?;
         Ok(Self { http, registry: DEFAULT_REGISTRY.to_string() })
+    }
+
+    /// A quick, short-timeout reachability check for `nermo doctor` — not
+    /// used on the normal install path, where a real request failing with a
+    /// real error is more informative than a separate up-front probe.
+    pub fn check_connectivity(&self) -> Result<()> {
+        let resp = self
+            .http
+            .get(&self.registry)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .with_context(|| format!("connecting to {}", self.registry))?;
+        if resp.status().is_success() || resp.status().is_redirection() {
+            Ok(())
+        } else {
+            bail!("registry responded with {}", resp.status());
+        }
     }
 
     /// Fetch metadata for one exact package version.

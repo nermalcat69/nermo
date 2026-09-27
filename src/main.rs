@@ -7,9 +7,10 @@ mod registry;
 mod resolver;
 mod store;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::env;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -38,11 +39,19 @@ enum Command {
         /// e.g. "react@19.0.0" or "@types/node@22.0.0"
         spec: String,
     },
+    /// Remove one or more dependencies from package.json, then reinstall to
+    /// update the lockfile and node_modules to match.
+    Remove {
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
     /// Inspect or maintain the global package store.
     Store {
         #[command(subcommand)]
         action: Option<StoreCommand>,
     },
+    /// Diagnose common configuration and installation problems.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -63,8 +72,10 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Install { frozen, prune } => install(frozen, prune),
         Command::Fetch { spec } => fetch(&spec),
+        Command::Remove { names } => remove(&names),
         Command::Store { action: None } => store_stats(),
         Command::Store { action: Some(StoreCommand::Prune { dry_run, yes }) } => store_prune(dry_run, yes),
+        Command::Doctor => doctor(),
     }
 }
 
@@ -84,6 +95,29 @@ fn fetch(spec: &str) -> Result<()> {
         println!("Downloaded and stored {name}@{version} at {}", path.display());
     }
     Ok(())
+}
+
+fn remove(names: &[String]) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let root = manifest::find_project_root(&cwd)?;
+
+    let removed = manifest::remove_dependencies(&root, names)?;
+    for name in names {
+        if removed.contains(name) {
+            println!("Removed {name}");
+        } else {
+            println!("{name} was not a dependency; skipped");
+        }
+    }
+    if removed.is_empty() {
+        return Ok(());
+    }
+
+    // package.json changed, so the existing lockfile won't match and
+    // install() will naturally re-resolve, relink (dropping the removed
+    // package's now-obsolete node_modules entry), and rewrite the lockfile.
+    println!();
+    install(false, false)
 }
 
 fn install(frozen: bool, prune: bool) -> Result<()> {
@@ -285,4 +319,116 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{size:.1} {}", UNITS[unit])
     }
+}
+
+/// Diagnose common problems (PRD §13.9): store health, registry reachability,
+/// and — when run inside a project — manifest/lockfile consistency and
+/// broken symlinks in node_modules. Never modifies anything; every check
+/// reports ok/warn/fail independently so one failure doesn't hide the rest.
+fn doctor() -> Result<()> {
+    println!("Nermo Doctor\n");
+    let mut problems = 0usize;
+
+    println!("[ok]   nermo {} running", env!("CARGO_PKG_VERSION"));
+
+    match store::Store::open() {
+        Ok(store) => {
+            let probe = store.root().join(".doctor-write-test");
+            match std::fs::write(&probe, b"x").and_then(|_| std::fs::remove_file(&probe)) {
+                Ok(()) => println!("[ok]   store is accessible and writable ({})", store.root().display()),
+                Err(e) => {
+                    println!("[fail] store at {} is not writable: {e}", store.root().display());
+                    problems += 1;
+                }
+            }
+        }
+        Err(e) => {
+            println!("[fail] could not open the store: {e}");
+            problems += 1;
+        }
+    }
+
+    match registry::Client::new().and_then(|c| c.check_connectivity()) {
+        Ok(()) => println!("[ok]   registry reachable (https://registry.npmjs.org)"),
+        Err(e) => {
+            println!("[fail] registry unreachable: {e}");
+            problems += 1;
+        }
+    }
+
+    match manifest::find_project_root(&env::current_dir()?) {
+        Err(_) => println!("\n(not inside a project — skipping project-specific checks)"),
+        Ok(root) => {
+            println!("\nProject: {}", root.display());
+
+            let manifest = match manifest::load(&root) {
+                Ok(m) => {
+                    println!("[ok]   package.json parses");
+                    Some(m)
+                }
+                Err(e) => {
+                    println!("[fail] package.json: {e}");
+                    problems += 1;
+                    None
+                }
+            };
+
+            match (lockfile::Lockfile::load(&root), &manifest) {
+                (Ok(Some(lock)), Some(manifest)) => {
+                    let mut direct = manifest.dependencies.clone();
+                    direct.extend(manifest.dev_dependencies.clone());
+                    if lock.matches_manifest(&direct) {
+                        println!("[ok]   {} is up to date with package.json", lockfile::FILE_NAME);
+                    } else {
+                        println!(
+                            "[warn] {} is stale (package.json changed); run `nermo install` to refresh it",
+                            lockfile::FILE_NAME
+                        );
+                    }
+                }
+                (Ok(None), _) => println!("[info] no {} yet; run `nermo install`", lockfile::FILE_NAME),
+                (Err(e), _) => {
+                    println!("[fail] {}: {e}", lockfile::FILE_NAME);
+                    problems += 1;
+                }
+                (Ok(Some(_)), None) => {} // package.json already reported as broken above
+            }
+
+            let broken = find_broken_symlinks(&root.join("node_modules"))?;
+            if broken.is_empty() {
+                println!("[ok]   no broken symlinks in node_modules");
+            } else {
+                println!("[fail] {} broken symlink(s) in node_modules:", broken.len());
+                for path in &broken {
+                    println!("         {}", path.display());
+                }
+                problems += broken.len();
+            }
+        }
+    }
+
+    println!();
+    if problems == 0 {
+        println!("No problems found.");
+    } else {
+        println!("{problems} problem(s) found.");
+    }
+    Ok(())
+}
+
+/// Any symlink under `node_modules` whose target no longer exists — usually
+/// means the global store was pruned or moved out from under a project that
+/// hasn't been reinstalled since.
+fn find_broken_symlinks(node_modules: &Path) -> Result<Vec<PathBuf>> {
+    if !node_modules.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut broken = Vec::new();
+    for entry in walkdir::WalkDir::new(node_modules) {
+        let entry = entry.context("walking node_modules")?;
+        if entry.path_is_symlink() && !entry.path().exists() {
+            broken.push(entry.path().to_path_buf());
+        }
+    }
+    Ok(broken)
 }

@@ -1,6 +1,7 @@
 use crate::resolver::{Graph, PackageKey};
 use crate::store::Store;
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -43,8 +44,49 @@ impl<'a> Linker<'a> {
                 self.place_link(&own_node_modules, &dep_key.0, &self.virtual_entry_dir(dep_key))?;
             }
         }
+        let wanted: BTreeSet<&str> = graph.roots.iter().map(|(name, _)| name.as_str()).collect();
         for key in &graph.roots {
             self.place_link(&self.node_modules, &key.0, &self.virtual_entry_dir(key))?;
+        }
+        self.remove_obsolete_root_links(&wanted)?;
+        Ok(())
+    }
+
+    /// Remove top-level `node_modules` entries for packages no longer in
+    /// `wanted` (e.g. after `nermo remove`, or an upgrade that drops a
+    /// transitive dependency from the root set). Only ever touches entries
+    /// that are themselves symlinks — the same "only what we manage" rule
+    /// `place_link` already enforces — so an unmanaged file or directory a
+    /// user put there is never removed.
+    fn remove_obsolete_root_links(&self, wanted: &BTreeSet<&str>) -> Result<()> {
+        let Ok(entries) = fs::read_dir(&self.node_modules) else { return Ok(()) };
+        for entry in entries {
+            let entry = entry.context("reading node_modules")?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".nermo" {
+                continue;
+            }
+
+            if name.starts_with('@') && entry.path().is_dir() && !entry.path().is_symlink() {
+                // A scope directory (e.g. "@types/"): its entries are the
+                // actual managed links, named "@scope/name".
+                let Ok(scoped) = fs::read_dir(entry.path()) else { continue };
+                for sub in scoped {
+                    let sub = sub.context("reading scoped node_modules entry")?;
+                    let scoped_name = format!("{name}/{}", sub.file_name().to_string_lossy());
+                    if !wanted.contains(scoped_name.as_str()) && sub.path().is_symlink() {
+                        fs::remove_file(sub.path())
+                            .with_context(|| format!("removing obsolete link {}", sub.path().display()))?;
+                    }
+                }
+                // Clean up the scope directory itself once it's empty.
+                if fs::read_dir(entry.path()).map(|mut d| d.next().is_none()).unwrap_or(false) {
+                    let _ = fs::remove_dir(entry.path());
+                }
+            } else if !wanted.contains(name.as_str()) && entry.path().is_symlink() {
+                fs::remove_file(entry.path())
+                    .with_context(|| format!("removing obsolete link {}", entry.path().display()))?;
+            }
         }
         Ok(())
     }
@@ -194,5 +236,30 @@ mod tests {
         let err = linker.place_link(node_modules.path(), "react", target.path()).unwrap_err();
         assert!(err.to_string().contains("unmanaged"));
         assert!(unmanaged.join("index.js").is_file(), "unmanaged file must survive");
+    }
+
+    #[test]
+    fn remove_obsolete_root_links_only_touches_managed_symlinks() {
+        let node_modules = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::for_test(store_root.path());
+        let linker = Linker { store: &store, node_modules: node_modules.path().to_path_buf() };
+
+        // A managed link to a package no longer wanted (e.g. `nermo remove left-pad`).
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target.path(), node_modules.path().join("left-pad")).unwrap();
+        // A managed scoped link, also no longer wanted.
+        fs::create_dir_all(node_modules.path().join("@types")).unwrap();
+        std::os::unix::fs::symlink(target.path(), node_modules.path().join("@types/left-pad")).unwrap();
+        // An unmanaged real directory a user created by hand.
+        fs::create_dir_all(node_modules.path().join("hand-rolled")).unwrap();
+        fs::write(node_modules.path().join("hand-rolled/index.js"), "keep me").unwrap();
+
+        linker.remove_obsolete_root_links(&BTreeSet::new()).unwrap();
+
+        assert!(!node_modules.path().join("left-pad").exists(), "obsolete managed link should be removed");
+        assert!(!node_modules.path().join("@types/left-pad").exists(), "obsolete scoped link should be removed");
+        assert!(!node_modules.path().join("@types").exists(), "emptied scope dir should be cleaned up");
+        assert!(node_modules.path().join("hand-rolled/index.js").is_file(), "unmanaged directory must survive");
     }
 }
