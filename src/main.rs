@@ -65,6 +65,12 @@ enum Command {
     /// Download and install the latest nermo release in place of the
     /// running binary.
     Upgrade,
+    /// Run a script from package.json's "scripts" (e.g. `nermo dev`, same
+    /// as `npm run dev`), with node_modules/.bin on PATH so a script that
+    /// invokes a CLI another dependency provides (react-router, vite,
+    /// wrangler, ...) finds it without needing a global install.
+    #[command(external_subcommand)]
+    Run(Vec<String>),
 }
 
 #[derive(Subcommand)]
@@ -92,6 +98,7 @@ fn main() -> Result<()> {
         Command::Store { action: Some(StoreCommand::Prune { dry_run, yes }) } => store_prune(dry_run, yes),
         Command::Doctor => doctor(),
         Command::Upgrade => selfupdate::upgrade(),
+        Command::Run(args) => run_script(&args),
     };
 
     // Runs on every command except `upgrade` itself: a cheap, cached,
@@ -103,6 +110,56 @@ fn main() -> Result<()> {
     }
 
     result
+}
+
+/// `nermo <script> [args...]`, matching `npm run <script>`: look up
+/// `package.json`'s `scripts[<script>]` and run it through a shell with
+/// `node_modules/.bin` prepended to PATH, so a script that shells out to a
+/// dependency's CLI (react-router, vite, wrangler, ...) finds it without a
+/// global install. Exits with the script's own exit code.
+fn run_script(args: &[String]) -> Result<()> {
+    let Some((script_name, extra_args)) = args.split_first() else {
+        anyhow::bail!("usage: nermo <script> [args...]");
+    };
+
+    let root = manifest::find_project_root(&env::current_dir().context("reading current directory")?)?;
+    let manifest = manifest::load(&root)?;
+    let Some(command) = manifest.scripts.get(script_name) else {
+        let mut msg = format!("no \"{script_name}\" script in package.json");
+        if !manifest.scripts.is_empty() {
+            let names: Vec<&str> = manifest.scripts.keys().map(String::as_str).collect();
+            msg.push_str(&format!(" (available: {})", names.join(", ")));
+        }
+        anyhow::bail!(msg);
+    };
+
+    // ponytail: extra args are appended to the script string as-is (npm
+    // itself doesn't shell-escape this case either) rather than passed
+    // through as real argv — fine for the common case this targets
+    // (`nermo dev`, no extra args); full `npm run -- ...` argv semantics
+    // would be a bigger feature than asked for.
+    let mut full_command = command.clone();
+    for arg in extra_args {
+        full_command.push(' ');
+        full_command.push_str(arg);
+    }
+
+    let bin_dir = root.join("node_modules").join(".bin");
+    let path_var = env::var_os("PATH").unwrap_or_default();
+    let new_path =
+        env::join_paths(std::iter::once(bin_dir).chain(env::split_paths(&path_var))).context("building PATH")?;
+
+    let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    let status = std::process::Command::new(shell)
+        .arg(flag)
+        .arg(&full_command)
+        .current_dir(&root)
+        .env("PATH", new_path)
+        .status()
+        .with_context(|| format!("running script {script_name:?}"))?;
+
+    selfupdate::notify_if_update_available();
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn fetch(spec: &str) -> Result<()> {

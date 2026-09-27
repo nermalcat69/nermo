@@ -279,7 +279,11 @@ fn lock_permissions(root: &Path) -> Result<()> {
     for entry in walkdir::WalkDir::new(root) {
         let entry = entry.context("walking extracted package")?;
         if entry.file_type().is_file() {
-            fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o444))
+            // 0o555, not 0o444: still fully read-only (immutability is what
+            // makes hardlinking/cloning safe, not the missing execute bit),
+            // but a package's own bin scripts need +x to actually run once
+            // shimmed into node_modules/.bin.
+            fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o555))
                 .with_context(|| format!("locking {}", entry.path().display()))?;
         }
     }

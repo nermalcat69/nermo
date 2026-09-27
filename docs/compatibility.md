@@ -28,12 +28,16 @@ a native binary (`rolldown`'s platform-specific binding), and nested
   same checkout. `nermo install --force` takes over conflicting unmanaged
   paths deliberately; without it, `rm -rf node_modules` first works too, same
   as switching between npm/pnpm/bun themselves requires.
-- **`.bin` shims aren't created.** `node_modules/.bin/vite` doesn't exist,
-  so `npm run build` / `npm run dev` (which rely on `.bin` being on `PATH`)
-  won't find the binary. Workaround used during testing: invoke the
-  package's entry script directly (`node node_modules/vite/bin/vite.js
-  build`). This is a real usability gap, not just a missing nicety — most
-  projects invoke tools through npm scripts.
+- **`.bin` shims: created on Unix, not yet on Windows.** `node_modules/.bin/vite`
+  is a real symlink to the package's `bin` script (npm's `bin` field, parsed
+  from registry metadata, persisted in `.nermo-lock`), so `npm run dev` /
+  `npm run build` work unmodified. `nermo <script>` (e.g. `nermo dev`) is
+  also available as a direct `npm run <script>` equivalent. On Windows this
+  is still a real gap: npm/pnpm generate a `.cmd`/`.ps1` wrapper there
+  instead of a symlink (a plain symlink to a script isn't directly
+  executable via `PATH` on Windows even where symlink privilege exists),
+  which isn't implemented — tracked alongside Windows' existing
+  symlink-privilege gap below.
 - **Resolver only understands a subset of npm's version-range grammar.**
   Exact versions, `^`, `~`, comparator operators, `*`, and OR ranges
   (`"^0.28.0 || ^0.29.0"`, split on `||` and matched against either side —

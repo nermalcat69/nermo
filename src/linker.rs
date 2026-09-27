@@ -61,16 +61,50 @@ impl<'a> Linker<'a> {
             let own_node_modules = self.virtual_entry_dir(key).join("node_modules");
             fs::create_dir_all(&own_node_modules)?;
             for edge in &pkg.dependencies {
-                let target = self.link_target(&edge.key, &graph.packages[&edge.key])?;
+                let dep_pkg = &graph.packages[&edge.key];
+                let target = self.link_target(&edge.key, dep_pkg)?;
                 self.place_link(&own_node_modules, &edge.local_name, &target)?;
+                self.place_bin_shims(&own_node_modules, dep_pkg, &target)?;
             }
         }
         let wanted: BTreeSet<&str> = graph.roots.iter().map(|edge| edge.local_name.as_str()).collect();
         for edge in &graph.roots {
-            let target = self.link_target(&edge.key, &graph.packages[&edge.key])?;
+            let root_pkg = &graph.packages[&edge.key];
+            let target = self.link_target(&edge.key, root_pkg)?;
             self.place_link(&self.node_modules, &edge.local_name, &target)?;
+            self.place_bin_shims(&self.node_modules, root_pkg, &target)?;
         }
         self.remove_obsolete_root_links(&wanted)?;
+        Ok(())
+    }
+
+    /// Create `.bin` shims (`parent_node_modules/.bin/<name>`) for every
+    /// npm `bin` entry `pkg` declares, pointing straight at its script
+    /// inside `target` (its store dir for a leaf, its virtual-store entry
+    /// otherwise). Reuses `place_link`'s own symlink bookkeeping — same
+    /// "only touch what we manage" guarantee, and already a no-op when the
+    /// shim already points at the right place.
+    //
+    // Unix-only for now: Windows can't run an extracted script via a plain
+    // symlink the way `npm`/`pnpm` do there (they generate a `.cmd`/`.ps1`
+    // wrapper instead), and Windows symlinks already need Developer
+    // Mode/admin rights regardless (see `symlink_dir` below) — a real gap,
+    // not silently papered over, tracked alongside the existing Windows
+    // symlink limitation.
+    #[cfg(unix)]
+    fn place_bin_shims(&self, parent_node_modules: &Path, pkg: &ResolvedPackage, target: &Path) -> Result<()> {
+        if pkg.bin.is_empty() {
+            return Ok(());
+        }
+        let bin_dir = parent_node_modules.join(".bin");
+        for (name, script_path) in &pkg.bin {
+            self.place_link(&bin_dir, name, &target.join(script_path))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn place_bin_shims(&self, _parent_node_modules: &Path, _pkg: &ResolvedPackage, _target: &Path) -> Result<()> {
         Ok(())
     }
 
@@ -283,6 +317,7 @@ fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn scoped_names_are_encoded_without_slashes() {
@@ -299,7 +334,7 @@ mod tests {
         let linker = Linker { store: &store, node_modules: PathBuf::from("/project/node_modules"), force: false };
 
         let leaf_key = ("left-pad".to_string(), "1.3.0".to_string());
-        let leaf = ResolvedPackage { tarball: String::new(), integrity: None, shasum: None, dependencies: vec![] };
+        let leaf = ResolvedPackage::default();
         let target = linker.link_target(&leaf_key, &leaf).unwrap();
         assert_eq!(target, store.package_dir("left-pad", "1.3.0").unwrap());
     }
@@ -312,13 +347,11 @@ mod tests {
 
         let key = ("debug".to_string(), "4.4.3".to_string());
         let non_leaf = ResolvedPackage {
-            tarball: String::new(),
-            integrity: None,
-            shasum: None,
             dependencies: vec![crate::resolver::DependencyEdge {
                 local_name: "ms".to_string(),
                 key: ("ms".to_string(), "2.1.3".to_string()),
             }],
+            ..Default::default()
         };
         let target = linker.link_target(&key, &non_leaf).unwrap();
         assert_eq!(target, linker.virtual_entry_dir(&key));
@@ -339,6 +372,41 @@ mod tests {
         assert!(dst.path().join("index.js").is_file());
         assert!(dst.path().join("lib/util.js").is_file());
         assert!(!dst.path().join(crate::store::COMPLETION_MARKER).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn place_bin_shims_creates_a_shim_pointing_at_the_packages_script() {
+        let node_modules = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::for_test(store_root.path());
+        let linker = Linker { store: &store, node_modules: node_modules.path().to_path_buf(), force: false };
+
+        let target = tempfile::tempdir().unwrap();
+        fs::write(target.path().join("cli.js"), "#!/usr/bin/env node").unwrap();
+        let pkg = ResolvedPackage {
+            bin: BTreeMap::from([("mytool".to_string(), "cli.js".to_string())]),
+            ..Default::default()
+        };
+
+        linker.place_bin_shims(node_modules.path(), &pkg, target.path()).unwrap();
+
+        let shim = node_modules.path().join(".bin/mytool");
+        assert!(shim.is_symlink());
+        assert_eq!(fs::read_link(&shim).unwrap(), target.path().join("cli.js"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn place_bin_shims_is_a_no_op_for_packages_without_bin_entries() {
+        let node_modules = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::for_test(store_root.path());
+        let linker = Linker { store: &store, node_modules: node_modules.path().to_path_buf(), force: false };
+
+        linker.place_bin_shims(node_modules.path(), &ResolvedPackage::default(), Path::new("/unused")).unwrap();
+
+        assert!(!node_modules.path().join(".bin").exists());
     }
 
     #[test]

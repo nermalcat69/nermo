@@ -41,6 +41,7 @@ nermo store               # show store stats (packages, disk usage, tracked proj
 nermo store prune         # remove packages no tracked project references (supports --dry-run, --yes)
 nermo doctor              # diagnose store/registry/project/lockfile/symlink problems
 nermo upgrade             # download and install the latest release over the running binary
+nermo dev                 # run package.json's "scripts.dev" (nermo <script> == npm run <script>)
 ```
 
 Every command also does a cheap, cached (once per 24h), best-effort check
@@ -80,9 +81,13 @@ handful of whole-directory clones, not a fresh download or a per-file walk.
 
 Implements the PRD's MVP P0 feature set (resolve → store → link → lock) plus
 store management (`store`, `store prune`, auto-prune on install by default, opt out with `--no-prune`),
-`remove`, `doctor`, and concurrent downloads/resolution. Not yet implemented:
-`--offline`, workspaces, `.bin` shims, and lifecycle scripts (disabled by
-design, not by accident — see `docs/compatibility.md`).
+`remove`, `doctor`, `.bin` shims (so `npm run <script>`/`nermo <script>` finds
+a dependency's CLI, e.g. `react-router`, `vite`, `wrangler`), and concurrent
+downloads/resolution. Not yet implemented: `--offline`, workspaces,
+`.bin` shims on Windows (needs `.cmd`/`.ps1` wrapper generation, not just a
+symlink — tracked alongside Windows' existing symlink-privilege gap), and
+lifecycle scripts (disabled by design, not by accident — see
+`docs/compatibility.md`).
 
 CI (`.github/workflows/ci.yml`) builds and runs the full test suite on
 macOS, Linux, and Windows for every push and pull request.

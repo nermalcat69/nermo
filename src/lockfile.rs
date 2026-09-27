@@ -43,6 +43,13 @@ struct LockedPackage {
     /// shape as `DirectDependency::resolved`.
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
+    /// npm `bin` entries: shim name -> script path relative to the package
+    /// root. Persisted so a `--frozen`/lockfile-reuse install can still set
+    /// up `.bin` shims without a live registry fetch. Absent for the vast
+    /// majority of packages, so skip writing an empty map to keep existing
+    /// lockfiles' diffs small.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    bin: BTreeMap<String, String>,
 }
 
 impl Lockfile {
@@ -70,6 +77,7 @@ impl Lockfile {
                         integrity: pkg.integrity.clone(),
                         shasum: pkg.shasum.clone(),
                         dependencies,
+                        bin: pkg.bin.clone(),
                     },
                 )
             })
@@ -106,6 +114,7 @@ impl Lockfile {
                     integrity: locked.integrity.clone(),
                     shasum: locked.shasum.clone(),
                     dependencies,
+                    bin: locked.bin.clone(),
                 },
             );
         }
@@ -189,6 +198,7 @@ mod tests {
                     local_name: "ms".to_string(),
                     key: ("ms".to_string(), "2.1.3".to_string()),
                 }],
+                bin: BTreeMap::new(),
             },
         );
         packages.insert(
@@ -198,6 +208,7 @@ mod tests {
                 integrity: Some("sha512-def".into()),
                 shasum: None,
                 dependencies: vec![],
+                bin: BTreeMap::new(),
             },
         );
         let graph = Graph {
@@ -243,6 +254,7 @@ mod tests {
                 integrity: Some("sha512-xyz".into()),
                 shasum: None,
                 dependencies: vec![],
+                bin: BTreeMap::new(),
             },
         );
         let graph = Graph {

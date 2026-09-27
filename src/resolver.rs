@@ -39,16 +39,30 @@ const METADATA_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Serialize, Deserialize)]
 struct DiskCacheEntry {
+    #[serde(default)]
+    format_version: u32,
     fetched_at_unix: u64,
     metadata: PackageMetadata,
 }
 
+/// Bump whenever `VersionMetadata`/`PackageMetadata` gains a field the
+/// resolver actually reads (like `bin`, added without this bump — an
+/// existing on-disk cache entry silently served stale-schema data with
+/// that field missing for up to a full TTL window instead of refetching).
+/// An entry with a mismatched (or, for pre-this-fix caches, absent/0)
+/// version is treated as a miss, same as an expired one.
+const CACHE_FORMAT_VERSION: u32 = 1;
+
+#[derive(Default)]
 pub struct ResolvedPackage {
     pub tarball: String,
     pub integrity: Option<String>,
     pub shasum: Option<String>,
     /// Direct dependency edges, already resolved to exact versions.
     pub dependencies: Vec<DependencyEdge>,
+    /// npm package.json `bin` entries: shim name -> script path relative to
+    /// the package root. Empty for the vast majority of packages.
+    pub bin: BTreeMap<String, String>,
 }
 
 /// The complete dependency graph: every resolved package keyed by
@@ -114,6 +128,9 @@ impl<'a> Resolver<'a> {
         let path = self.disk_cache_path(name)?;
         let text = std::fs::read_to_string(&path).ok()?;
         let entry: DiskCacheEntry = serde_json::from_str(&text).ok()?;
+        if entry.format_version != CACHE_FORMAT_VERSION {
+            return None;
+        }
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
         if now.saturating_sub(entry.fetched_at_unix) > METADATA_CACHE_TTL.as_secs() {
             return None;
@@ -130,7 +147,8 @@ impl<'a> Resolver<'a> {
             return;
         }
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        if let Ok(json) = serde_json::to_string(&DiskCacheEntry { fetched_at_unix: now, metadata: metadata.clone() }) {
+        let entry = DiskCacheEntry { format_version: CACHE_FORMAT_VERSION, fetched_at_unix: now, metadata: metadata.clone() };
+        if let Ok(json) = serde_json::to_string(&entry) {
             let _ = std::fs::write(&path, json);
         }
     }
@@ -239,7 +257,7 @@ impl<'a> Resolver<'a> {
             }
             packages.insert(
                 key.clone(),
-                ResolvedPackage { tarball: String::new(), integrity: None, shasum: None, dependencies: Vec::new() },
+                ResolvedPackage::default(),
             );
         }
 
@@ -263,6 +281,7 @@ impl<'a> Resolver<'a> {
 
         let mut packages = self.packages.lock().unwrap();
         let entry = packages.get_mut(&key).expect("just inserted");
+        entry.bin = vmeta.bin_entries();
         entry.tarball = vmeta.dist.tarball;
         entry.integrity = vmeta.dist.integrity;
         entry.shasum = vmeta.dist.shasum;
@@ -434,6 +453,7 @@ mod tests {
                             optional_dependencies: BTreeMap::new(),
                             os: None,
                             cpu: None,
+                            bin_field: None,
                         },
                     )
                 })
@@ -459,7 +479,7 @@ mod tests {
         let resolver = Resolver::new(&client);
         resolver.packages.lock().unwrap().insert(
             ("semver".to_string(), "6.3.1".to_string()),
-            ResolvedPackage { tarball: String::new(), integrity: None, shasum: None, dependencies: Vec::new() },
+            ResolvedPackage::default(),
         );
 
         // Real case from a real project: one consumer wants semver ^6, a
@@ -475,7 +495,7 @@ mod tests {
         let resolver = Resolver::new(&client);
         resolver.packages.lock().unwrap().insert(
             ("semver".to_string(), "6.3.1".to_string()),
-            ResolvedPackage { tarball: String::new(), integrity: None, shasum: None, dependencies: Vec::new() },
+            ResolvedPackage::default(),
         );
 
         // ^7.0.0 is not satisfied by 6.3.1 -- must not force an incompatible reuse.
@@ -488,7 +508,7 @@ mod tests {
         let resolver = Resolver::new(&client);
         resolver.packages.lock().unwrap().insert(
             ("esbuild-darwin-arm64".to_string(), "0.28.1".to_string()),
-            ResolvedPackage { tarball: String::new(), integrity: None, shasum: None, dependencies: Vec::new() },
+            ResolvedPackage::default(),
         );
 
         assert_eq!(
@@ -519,6 +539,7 @@ mod tests {
 
         let meta = fake_metadata(&["1.0.0"]);
         let stale_entry = DiskCacheEntry {
+            format_version: CACHE_FORMAT_VERSION,
             fetched_at_unix: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
                 - METADATA_CACHE_TTL.as_secs()
                 - 1,
@@ -528,6 +549,27 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&stale_entry).unwrap()).unwrap();
 
         assert!(resolver.read_disk_cache("demo").is_none(), "an expired entry must not be trusted");
+    }
+
+    #[test]
+    fn disk_cache_ignores_entries_from_an_older_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::new().unwrap();
+        let resolver = Resolver::new(&client).with_disk_cache(dir.path().to_path_buf());
+
+        let meta = fake_metadata(&["1.0.0"]);
+        let old_schema_entry = DiskCacheEntry {
+            format_version: CACHE_FORMAT_VERSION.wrapping_sub(1),
+            fetched_at_unix: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            metadata: meta,
+        };
+        let path = resolver.disk_cache_path("demo").unwrap();
+        std::fs::write(&path, serde_json::to_string(&old_schema_entry).unwrap()).unwrap();
+
+        assert!(
+            resolver.read_disk_cache("demo").is_none(),
+            "a fresh-but-older-schema entry must not be trusted (it may be silently missing fields, e.g. bin)"
+        );
     }
 
     #[test]

@@ -11,6 +11,8 @@ pub struct Manifest {
     pub dependencies: BTreeMap<String, String>,
     #[serde(rename = "devDependencies", default)]
     pub dev_dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    pub scripts: BTreeMap<String, String>,
 }
 
 /// Walk up from `start` looking for a directory containing package.json.

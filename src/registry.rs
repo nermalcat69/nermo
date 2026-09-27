@@ -47,6 +47,33 @@ pub struct VersionMetadata {
     pub os: Option<Vec<String>>,
     #[serde(default)]
     pub cpu: Option<Vec<String>>,
+    /// npm's package.json `bin` field, either a single path (binary name
+    /// defaults to the package's own unscoped name) or a name->path map.
+    #[serde(default, rename = "bin")]
+    pub bin_field: Option<BinField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BinField {
+    Single(String),
+    Named(BTreeMap<String, String>),
+}
+
+impl VersionMetadata {
+    /// Resolve `bin` into its final name -> script-path form, applying
+    /// npm's own-name convention for the single-path shorthand (the binary
+    /// name is the package's name with any `@scope/` stripped).
+    pub fn bin_entries(&self) -> BTreeMap<String, String> {
+        match &self.bin_field {
+            None => BTreeMap::new(),
+            Some(BinField::Named(map)) => map.clone(),
+            Some(BinField::Single(path)) => {
+                let name = self.name.rsplit('/').next().unwrap_or(&self.name);
+                BTreeMap::from([(name.to_string(), path.clone())])
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +195,42 @@ fn encode_name(name: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn meta(name: &str, bin_field: Option<BinField>) -> VersionMetadata {
+        VersionMetadata {
+            name: name.into(),
+            version: "1.0.0".into(),
+            dist: Dist { tarball: "https://example/x.tgz".into(), integrity: None, shasum: None },
+            dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            os: None,
+            cpu: None,
+            bin_field,
+        }
+    }
+
+    #[test]
+    fn bin_entries_is_empty_when_no_bin_field() {
+        assert!(meta("demo", None).bin_entries().is_empty());
+    }
+
+    #[test]
+    fn bin_entries_named_map_passes_through_unchanged() {
+        let map = BTreeMap::from([("foo".to_string(), "./bin/foo.js".to_string())]);
+        assert_eq!(meta("demo", Some(BinField::Named(map.clone()))).bin_entries(), map);
+    }
+
+    #[test]
+    fn bin_entries_single_string_uses_unscoped_package_name() {
+        let entries = meta("@scope/cli-tool", Some(BinField::Single("./bin/run.js".into()))).bin_entries();
+        assert_eq!(entries, BTreeMap::from([("cli-tool".to_string(), "./bin/run.js".to_string())]));
+    }
+
+    #[test]
+    fn bin_entries_single_string_unscoped_name_is_used_as_is() {
+        let entries = meta("plain-cli", Some(BinField::Single("./bin/run.js".into()))).bin_entries();
+        assert_eq!(entries, BTreeMap::from([("plain-cli".to_string(), "./bin/run.js".to_string())]));
+    }
 
     #[test]
     fn with_retries_succeeds_after_transient_failures() {
