@@ -98,7 +98,19 @@ impl<'a> Linker<'a> {
         }
         let bin_dir = parent_node_modules.join(".bin");
         for (name, script_path) in &pkg.bin {
-            self.place_link(&bin_dir, name, &target.join(script_path))?;
+            let script = target.join(script_path);
+            // Content already in the store from before lock_permissions
+            // started setting 0o555 (or hardlinked/cloned from it) is still
+            // missing the execute bit; repair it here so an existing store
+            // doesn't need a full re-extraction for shims to actually run.
+            if let Ok(meta) = fs::metadata(&script) {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o111 == 0 {
+                    fs::set_permissions(&script, fs::Permissions::from_mode(0o555))
+                        .with_context(|| format!("marking {} executable", script.display()))?;
+                }
+            }
+            self.place_link(&bin_dir, name, &script)?;
         }
         Ok(())
     }
@@ -372,6 +384,32 @@ mod tests {
         assert!(dst.path().join("index.js").is_file());
         assert!(dst.path().join("lib/util.js").is_file());
         assert!(!dst.path().join(crate::store::COMPLETION_MARKER).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn place_bin_shims_repairs_a_script_missing_the_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let node_modules = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::for_test(store_root.path());
+        let linker = Linker { store: &store, node_modules: node_modules.path().to_path_buf(), force: false };
+
+        let target = tempfile::tempdir().unwrap();
+        let script = target.path().join("cli.js");
+        fs::write(&script, "#!/usr/bin/env node").unwrap();
+        // Content extracted before lock_permissions started using 0o555.
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o444)).unwrap();
+        let pkg = ResolvedPackage {
+            bin: BTreeMap::from([("mytool".to_string(), "cli.js".to_string())]),
+            ..Default::default()
+        };
+
+        linker.place_bin_shims(node_modules.path(), &pkg, target.path()).unwrap();
+
+        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "script should have been made executable");
     }
 
     #[test]
