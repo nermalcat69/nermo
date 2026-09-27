@@ -375,6 +375,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    // Windows' symlink_dir needs Developer Mode or admin rights (see the
+    // ponytail note on the Windows symlink_dir impl above); standard CI
+    // runners have neither, so this test — which only exercises symlink
+    // bookkeeping, not that Windows gap itself — stays unix-only rather
+    // than failing at runtime on every stock Windows machine and runner.
     fn remove_obsolete_root_links_only_touches_managed_symlinks() {
         let node_modules = tempfile::tempdir().unwrap();
         let store_root = tempfile::tempdir().unwrap();
