@@ -6,7 +6,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = ".nermo-lock";
-const LOCKFILE_VERSION: u32 = 1;
+// Bumped to 2: an existing lockfile written before the `bin` field existed
+// would otherwise be silently reused as-is (`matches_manifest` only checks
+// dependency ranges, not schema completeness) with every package's `bin`
+// defaulting to empty — .bin shims would just never get created for a
+// project that already had a lockfile, with no error or indication why.
+// `load` below already hard-errors on a version mismatch rather than
+// silently reinterpreting old data, so this makes that existing safety net
+// actually catch this case.
+const LOCKFILE_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Lockfile {
@@ -182,6 +190,19 @@ pub(crate) fn decode_key(key: &str) -> Result<PackageKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_rejects_a_lockfile_from_an_older_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            r#"{"lockfileVersion":1,"direct":{},"packages":{}}"#,
+        )
+        .unwrap();
+
+        let err = Lockfile::load(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("delete it and reinstall"));
+    }
 
     fn sample_graph() -> (BTreeMap<String, String>, Graph) {
         let mut direct_ranges = BTreeMap::new();
