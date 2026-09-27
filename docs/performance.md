@@ -474,3 +474,58 @@ ceiling" conclusion wasn't wrong, it was scoped to the wrong phase — it
 correctly described the store/download phase, and got incorrectly
 generalized to the resolve phase without checking whether resolve was
 actually bandwidth-bound at all (it wasn't; it was compression-bound).
+
+## Update — the resolver was resolving more distinct versions than necessary
+
+Asked directly to instrument bytes downloaded (not just wall-clock time),
+using real network-interface byte counters (`netstat -ib`) around both
+tools on the identical real project: **nermo transferred 317.2MB, bun
+transferred 244.3MB** — a 73MB, ~23% gap neither compression nor bandwidth
+explains, since both tools hit the same registry over the same connection.
+
+Diffed the actual resolved package sets (nermo's `.nermo-lock` vs bun's
+`bun.lock`, tolerant-parsed since it's JSONC) rather than guessing. Two
+findings:
+
+- Bun's lockfile has *more* total entries (589 vs 460) but 129 of them are
+  platform-variant siblings it *records* (for cross-platform lockfile
+  portability — something `docs/lockfile.md` already flags as a gap in
+  nermo's own lockfile) without *downloading* most of them.
+- **34 packages resolve to meaningfully different versions** — not
+  randomly: `semver` (nermo 7.8.5 vs bun 6.3.1), `source-map` (0.7.6 vs
+  0.6.1), `picomatch` (4.0.7 vs 2.3.2). The pattern: nermo's resolver always
+  independently picks the highest version satisfying each edge's range;
+  real npm/pnpm/bun resolvers reuse an already-resolved compatible version
+  from elsewhere in the graph when one exists, rather than minting a new
+  one. Confirmed in the code: `resolve_one` called `pick_version` against
+  the full registry unconditionally, with no check for an existing
+  compatible resolution first.
+
+Added `Resolver::find_reusable_version`: before resolving a fresh version
+for an edge, check whether an already-resolved version of that package
+already satisfies the edge's range (mirroring `pick_version`'s own
+exact-vs-semver-range logic so behavior stays consistent), and reuse it
+instead of minting a new one. Applied to both regular dependency resolution
+and `resolve_optional` (where it has a bonus effect: two different parent
+versions both needing the same platform-variant binary now skip the second
+platform-check network round trip entirely, not just the download).
+
+Real result on the same project, confirmed with real bytes, not estimates:
+
+| | before | after |
+|---|---|---|
+| Distinct packages | 480 | 477 |
+| Bytes downloaded | 317.2MB | 306.1MB |
+
+A real, correctly-earned ~3.5% reduction — smaller than the full 73MB gap,
+and worth being honest about why: several of the 34 version differences
+trace back further than a single leaf-level reuse check can fix. nermo
+resolving a *newer parent package* (because it always picks max-satisfying
+at every level) can mean that parent declares a genuinely newer transitive
+requirement (`semver: ^7.0.0`) that an older, bun-resolved version
+genuinely doesn't satisfy — that's not a missed reuse check, it's a
+cascading version-selection difference propagating through the whole
+graph. Fully closing that gap would mean replicating substantially more of
+real npm/yarn/pnpm's hoisting and dedup-preference algorithm, which is one
+of the most heavily-engineered, complex parts of any real package manager
+— a legitimately larger undertaking than this fix, not attempted here.
