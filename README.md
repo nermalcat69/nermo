@@ -33,7 +33,7 @@ attaches them to a GitHub Release automatically.
 cd your-project         # any project with a package.json
 nermo install            # resolve, download into the shared store, link node_modules
 nermo install --frozen   # require .nermo-lock to be present and up to date; never re-resolve
-nermo install --prune    # after installing, also free any store package no project uses anymore
+nermo install --no-prune # skip the default after-install prune (on by default, see below)
 nermo install --force    # take over node_modules entries left by another package manager (bun/npm/pnpm)
 nermo remove react zod   # remove dependencies from package.json and reinstall to match
 nermo fetch react@19.0.0 # ensure one package version is in the store, without installing a project
@@ -79,7 +79,7 @@ handful of whole-directory clones, not a fresh download or a per-file walk.
 ## Status
 
 Implements the PRD's MVP P0 feature set (resolve → store → link → lock) plus
-store management (`store`, `store prune`, opt-in auto-prune on install),
+store management (`store`, `store prune`, auto-prune on install by default, opt out with `--no-prune`),
 `remove`, `doctor`, and concurrent downloads/resolution. Not yet implemented:
 `--offline`, workspaces, `.bin` shims, and lifecycle scripts (disabled by
 design, not by accident — see `docs/compatibility.md`).

@@ -29,11 +29,13 @@ enum Command {
         /// Require a compatible, up-to-date lockfile; never re-resolve.
         #[arg(long)]
         frozen: bool,
-        /// After installing, remove any store package this project no
-        /// longer depends on if no other tracked project needs it either
-        /// (e.g. an old `next` version left behind after an upgrade).
+        /// Skip the after-install prune (on by default): removing any store
+        /// package this project no longer depends on if no other tracked
+        /// project needs it either (e.g. an old `next` version left behind
+        /// after an upgrade). Pass this if you'd rather manage store size
+        /// yourself via `nermo store prune`.
         #[arg(long)]
-        prune: bool,
+        no_prune: bool,
         /// Overwrite unmanaged node_modules entries left by another package
         /// manager (e.g. after switching from bun/npm/pnpm) instead of
         /// refusing to touch them. Off by default: this deletes files nermo
@@ -83,7 +85,7 @@ fn main() -> Result<()> {
     let is_upgrade = matches!(cli.command, Command::Upgrade);
 
     let result = match cli.command {
-        Command::Install { frozen, prune, force } => install(frozen, prune, force),
+        Command::Install { frozen, no_prune, force } => install(frozen, !no_prune, force),
         Command::Fetch { spec } => fetch(&spec),
         Command::Remove { names } => remove(&names),
         Command::Store { action: None } => store_stats(),
@@ -140,8 +142,10 @@ fn remove(names: &[String]) -> Result<()> {
     // package.json changed, so the existing lockfile won't match and
     // install() will naturally re-resolve, relink (dropping the removed
     // package's now-obsolete node_modules entry), and rewrite the lockfile.
+    // Prune on by default here too: removing a dependency is exactly the
+    // case most likely to leave a now-unused package behind in the store.
     println!();
-    install(false, false, false)
+    install(false, true, false)
 }
 
 fn install(frozen: bool, prune: bool, force: bool) -> Result<()> {
