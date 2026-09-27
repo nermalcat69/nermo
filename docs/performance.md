@@ -426,3 +426,51 @@ metadata-format fix pointed to earlier in this document). Total install time
 on this project is still dominated by the store phase's bandwidth ceiling
 (§2 above), which is a property of the network, not something further
 software changes here can fix.
+
+## Update — the actual answer to "why is bun still faster": we never asked for gzip
+
+Prompted by a fair, pointed question ("if the network is really saturated,
+why does bun move the same bytes faster on the same network?"). If a
+network ceiling were the whole story, both tools transferring the same data
+over the same pipe should take similar time — they didn't (56-63s bun vs
+92-96s nermo), so something else had to be different. Two experiments
+resolved it:
+
+**Confirmed the earlier "network ceiling" conclusion was still correct, but
+incomplete.** Single-connection throughput to a completely unrelated CDN
+(nodejs.org via Cloudflare, nothing to do with npm) matched npm's ~4.8 MB/s
+exactly, and 8 parallel connections to that same unrelated CDN achieved
+**3.91 MB/s — worse than one connection**. That part of the reasoning holds:
+raw tarball transfer for large files really is bandwidth-bound on this
+network, independent of which CDN or how many connections.
+
+**But the resolve phase isn't a large-file transfer problem — it's many
+JSON metadata requests, and `Cargo.toml` never enabled reqwest's `gzip`/
+`brotli` features.** That means every single metadata request went out
+without `Accept-Encoding`, and the registry had no reason to compress its
+response. Confirmed directly: `wrangler`'s metadata document is 16.27MB
+uncompressed vs 2.0MB gzip-compressed — an 8x difference, for identical
+data. This wasn't a network limitation at all; it was nermo never asking
+for the obvious optimization every other npm-ecosystem tool uses by
+default.
+
+Fix: `reqwest = { features = ["blocking", "json", "gzip", "brotli"] }` —
+no code changes needed, `reqwest` handles the header and transparent
+decompression internally.
+
+Result on the real 480-package project, confirmed with two runs:
+
+| | resolve phase | total install |
+|---|---|---|
+| before | 38.94s | 92.51s |
+| **after** | **10.27s, 10.38s** | **~71s** |
+| bun (same run) | — | 62.84s |
+
+The bun gap closed from **1.6x to ~1.13x**. Store phase (large tarball
+downloads, already gzipped `.tgz` files where HTTP-layer compression barely
+applies) is unaffected, as expected — still the genuine bandwidth-bound
+part. This is the real lesson from the whole investigation: the "network
+ceiling" conclusion wasn't wrong, it was scoped to the wrong phase — it
+correctly described the store/download phase, and got incorrectly
+generalized to the resolve phase without checking whether resolve was
+actually bandwidth-bound at all (it wasn't; it was compression-bound).
