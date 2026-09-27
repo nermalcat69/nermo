@@ -170,3 +170,56 @@ separate `nermo install` invocations. Unlike the concurrency fix, caching
 wouldn't help a single cold resolve of a brand-new package tree (there's
 nothing to have cached yet), so the two levers are complementary, not
 alternatives.
+
+## Update — a real 484-package production project, and two timeout bugs
+
+A real project (React Router + Cloudflare Workers + Drizzle + Radix UI + ~50
+direct dependencies) surfaced two genuine bugs that none of the synthetic
+benchmarks above caught, both around registry request timeouts, plus a
+missing resolver feature (npm dependency aliases — see
+`docs/compatibility.md`; unrelated to performance but hit in the same run).
+
+**Bug 1: `@types/node`'s full metadata document is 11MB.** Fixed by
+requesting npm's "abbreviated" install-metadata format
+(`Accept: application/vnd.npm.install-v1+json`), the same one npm/pnpm
+themselves use — cuts it to ~2MB for `@types/node` while keeping every field
+the resolver needs.
+
+**Bug 2: that fix wasn't enough for every package.** `wrangler` has ~700
+published versions each listing dozens of dependencies; its abbreviated
+metadata is still ~16MB, because the bloat here is in dependency data the
+resolver actually needs, not the readmes/history the abbreviated format
+strips. No metadata-format trick shrinks a payload that's legitimately that
+large. The real bug was the flat 30-second request timeout (tuned against a
+fast connection and small packages) applying to *every* registry request,
+including tarball downloads for large native packages. Fixed by raising it
+to 180s with a separate 10s `connect_timeout` — a real timeout should only
+fire when nothing is happening, not when a large-but-progressing transfer is
+merely slow.
+
+Full install of the real project, cold (empty store, no lockfile):
+
+```
+Found 484 packages.
+Multiple versions in the graph: (20 packages, e.g. wrangler: 4.141.0, 4.142.0)
+Checking global store...
+Downloaded: 484, reused: 0
+Duration: 129.47s (resolve 50.91s, store 72.25s, link 6.29s)
+```
+
+Second install right after (unchanged lockfile, warm store):
+
+```
+Packages: 484
+Downloaded: 0
+Reused: 484
+Duration: 64ms (resolve 1ms, store 1ms, link 54ms)
+```
+
+129s → 64ms, ~2000x, for the case the PRD says matters most (§15.1: warm
+installs). The cold number is honest, not great — 484 packages is a large
+graph, and the still-sequential-across-nodes resolver depth (not the
+per-node fan-out width) plus 484 tarball downloads both take real time. This
+is real production data, not a synthetic benchmark, and it's the best
+evidence yet that the still-undone "parallelize/cache resolver metadata
+across the whole graph, not just per-node" lever matters at real-world scale.

@@ -7,6 +7,19 @@ use std::sync::{Arc, Mutex};
 
 pub type PackageKey = (String, String);
 
+/// One dependency edge: the name it's required/linked under in the
+/// dependent's own `node_modules` (`local_name`), and the package it
+/// actually resolves to (`key`). These differ only for npm dependency
+/// aliases (`"local-name": "npm:real-name@range"` in package.json) — e.g.
+/// posthog-js depends on `"web-vitals-soft-navs": "npm:web-vitals@6.2.1"` to
+/// bundle a pinned copy of `web-vitals` under a different local name. For an
+/// ordinary (non-aliased) dependency, `local_name == key.0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyEdge {
+    pub local_name: String,
+    pub key: PackageKey,
+}
+
 /// Max concurrent registry round trips the resolver will have in flight at
 /// once, mirrored per recursion level (see `Resolver::fan_out`) rather than
 /// globally — see the `ponytail:` note below.
@@ -17,7 +30,7 @@ pub struct ResolvedPackage {
     pub integrity: Option<String>,
     pub shasum: Option<String>,
     /// Direct dependency edges, already resolved to exact versions.
-    pub dependencies: Vec<PackageKey>,
+    pub dependencies: Vec<DependencyEdge>,
 }
 
 /// The complete dependency graph: every resolved package keyed by
@@ -26,7 +39,7 @@ pub struct ResolvedPackage {
 /// when transitive requirements conflict (see PRD §10.2).
 pub struct Graph {
     pub packages: BTreeMap<PackageKey, ResolvedPackage>,
-    pub roots: Vec<PackageKey>,
+    pub roots: Vec<DependencyEdge>,
 }
 
 /// Resolves a dependency graph with concurrent registry metadata fetches.
@@ -70,6 +83,19 @@ impl<'a> Resolver<'a> {
         Ok(Graph { packages, roots })
     }
 
+    /// npm dependency aliases look like `"local-name": "npm:real-name@range"`
+    /// — the package actually fetched and resolved is `real-name@range`, but
+    /// it's required under `local-name` (PRD §10.1: "dependency aliases").
+    /// Everything below this point (metadata cache key, version picking,
+    /// graph dedup key) must use the *real* name; only the edge's
+    /// `local_name` should reflect what was declared in package.json.
+    fn resolve_alias(local_name: &str, range: &str) -> (String, String) {
+        match range.strip_prefix("npm:").and_then(|rest| rest.rsplit_once('@').filter(|(n, _)| !n.is_empty())) {
+            Some((real_name, real_range)) => (real_name.to_string(), real_range.to_string()),
+            None => (local_name.to_string(), range.to_string()),
+        }
+    }
+
     fn metadata(&self, name: &str) -> Result<Arc<PackageMetadata>> {
         if let Some(cached) = self.metadata_cache.lock().unwrap().get(name) {
             return Ok(cached.clone());
@@ -83,24 +109,31 @@ impl<'a> Resolver<'a> {
     }
 
     /// Resolve a batch of dependency edges concurrently and return the
-    /// resulting package keys (order is not meaningful — nothing downstream
-    /// depends on dependency-edge order).
-    fn fan_out(&self, items: &[DepEdge]) -> Result<Vec<PackageKey>> {
-        let resolved: Mutex<Vec<PackageKey>> = Mutex::new(Vec::with_capacity(items.len()));
+    /// resulting edges (order is not meaningful — nothing downstream depends
+    /// on dependency-edge order).
+    fn fan_out(&self, items: &[DepEdge]) -> Result<Vec<DependencyEdge>> {
+        let resolved: Mutex<Vec<DependencyEdge>> = Mutex::new(Vec::with_capacity(items.len()));
         parallel_for_each(items, CONCURRENCY, |item| {
-            let key = match item {
-                DepEdge::Required(name, range) => Some(self.resolve_one(name, range)?),
-                DepEdge::Optional(name, range) => self.resolve_optional(name, range),
+            let edge = match item {
+                DepEdge::Required(local_name, range) => {
+                    Some(DependencyEdge { local_name: local_name.clone(), key: self.resolve_one(local_name, range)? })
+                }
+                DepEdge::Optional(local_name, range) => self
+                    .resolve_optional(local_name, range)
+                    .map(|key| DependencyEdge { local_name: local_name.clone(), key }),
             };
-            if let Some(key) = key {
-                resolved.lock().unwrap().push(key);
+            if let Some(edge) = edge {
+                resolved.lock().unwrap().push(edge);
             }
             Ok(())
         })?;
         Ok(resolved.into_inner().unwrap())
     }
 
-    fn resolve_one(&self, name: &str, range: &str) -> Result<PackageKey> {
+    fn resolve_one(&self, local_name: &str, range: &str) -> Result<PackageKey> {
+        let (name, range) = Self::resolve_alias(local_name, range);
+        let name = name.as_str();
+        let range = range.as_str();
         let meta = self.metadata(name)?;
         let version = pick_version(name, range, &meta)?;
         let key: PackageKey = (name.to_string(), version.clone());
@@ -143,17 +176,18 @@ impl<'a> Resolver<'a> {
     /// is never fatal to the whole resolve: a registry lookup failure or a
     /// version that isn't built for this OS/CPU just means "not needed here"
     /// rather than a broken graph.
-    fn resolve_optional(&self, name: &str, range: &str) -> Option<PackageKey> {
+    fn resolve_optional(&self, local_name: &str, range: &str) -> Option<PackageKey> {
+        let (name, real_range) = Self::resolve_alias(local_name, range);
         let applies_here = {
-            let meta = self.metadata(name).ok()?;
-            let version = pick_version(name, range, &meta).ok()?;
+            let meta = self.metadata(&name).ok()?;
+            let version = pick_version(&name, &real_range, &meta).ok()?;
             let vmeta = &meta.versions[&version];
             platform_matches(&vmeta.os, current_os()) && platform_matches(&vmeta.cpu, current_cpu())
         };
         if !applies_here {
             return None;
         }
-        self.resolve_one(name, range).ok()
+        self.resolve_one(local_name, range).ok()
     }
 }
 
@@ -200,10 +234,11 @@ fn current_cpu() -> &'static str {
 
 /// Pick the highest published version satisfying `range`.
 ///
-/// Supports exact versions and Cargo/semver-style comparator ranges (`^`,
-/// `~`, `>=`, `*`, ...), which cover the common npm cases. Not supported:
-/// hyphen ranges ("1.2.3 - 2.3.4"), OR ranges ("1.x || 2.x"), and dist-tags
-/// like "latest" — real npm ranges the MVP resolver doesn't parse yet.
+/// Supports exact versions, Cargo/semver-style comparator ranges (`^`, `~`,
+/// `>=`, `*`, ...), and OR ranges ("^0.28.0 || ^0.29.0", common in real
+/// packages' peerDependencies) by splitting on `||` and matching any side.
+/// Not supported: hyphen ranges ("1.2.3 - 2.3.4") and dist-tags like
+/// "latest" — real npm ranges the MVP resolver still doesn't parse.
 fn pick_version(name: &str, range: &str, meta: &PackageMetadata) -> Result<String> {
     if let Ok(exact) = Version::parse(range) {
         let exact = exact.to_string();
@@ -212,11 +247,16 @@ fn pick_version(name: &str, range: &str, meta: &PackageMetadata) -> Result<Strin
         }
     }
 
-    let req = VersionReq::parse(range).with_context(|| format!("unsupported version range {range:?} for {name}"))?;
+    let reqs: Vec<VersionReq> = range
+        .split("||")
+        .map(|part| VersionReq::parse(part.trim()))
+        .collect::<std::result::Result<_, _>>()
+        .with_context(|| format!("unsupported version range {range:?} for {name}"))?;
+
     meta.versions
         .keys()
         .filter_map(|v| Version::parse(v).ok())
-        .filter(|v| req.matches(v))
+        .filter(|v| reqs.iter().any(|req| req.matches(v)))
         .max()
         .map(|v| v.to_string())
         .ok_or_else(|| anyhow!("no published version of {name} satisfies {range}"))
@@ -259,6 +299,45 @@ mod tests {
     fn exact_version_is_preferred_verbatim() {
         let meta = fake_metadata(&["1.0.0", "1.2.0"]);
         assert_eq!(pick_version("demo", "1.2.0", &meta).unwrap(), "1.2.0");
+    }
+
+    #[test]
+    fn resolve_alias_extracts_real_name_and_range() {
+        // Real-world case: posthog-js depends on
+        // "web-vitals-soft-navs": "npm:web-vitals@6.2.1" to bundle a pinned
+        // web-vitals under a different local name.
+        let (name, range) = Resolver::resolve_alias("web-vitals-soft-navs", "npm:web-vitals@6.2.1");
+        assert_eq!(name, "web-vitals");
+        assert_eq!(range, "6.2.1");
+    }
+
+    #[test]
+    fn resolve_alias_handles_scoped_real_names() {
+        let (name, range) = Resolver::resolve_alias("local-alias", "npm:@types/node@^22.0.0");
+        assert_eq!(name, "@types/node");
+        assert_eq!(range, "^22.0.0");
+    }
+
+    #[test]
+    fn resolve_alias_is_a_no_op_for_ordinary_ranges() {
+        let (name, range) = Resolver::resolve_alias("react", "^19.0.0");
+        assert_eq!(name, "react");
+        assert_eq!(range, "^19.0.0");
+    }
+
+    #[test]
+    fn or_range_matches_either_side() {
+        let meta = fake_metadata(&["0.28.17", "0.28.20", "0.29.0", "0.29.5", "0.30.0"]);
+        // Real-world case: kysely's peerDependency on kysely-codegen-style
+        // adapters looks like "^0.28.17 || ^0.29.0" — matches should span
+        // both sides but stay within each caret range's ceiling.
+        assert_eq!(pick_version("demo", "^0.28.17 || ^0.29.0", &meta).unwrap(), "0.29.5");
+    }
+
+    #[test]
+    fn or_range_with_no_matching_side_is_an_error() {
+        let meta = fake_metadata(&["1.0.0"]);
+        assert!(pick_version("demo", "^2.0.0 || ^3.0.0", &meta).is_err());
     }
 
     #[test]

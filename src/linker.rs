@@ -40,13 +40,13 @@ impl<'a> Linker<'a> {
         for (key, pkg) in &graph.packages {
             let own_node_modules = self.virtual_entry_dir(key).join("node_modules");
             fs::create_dir_all(&own_node_modules)?;
-            for dep_key in &pkg.dependencies {
-                self.place_link(&own_node_modules, &dep_key.0, &self.virtual_entry_dir(dep_key))?;
+            for edge in &pkg.dependencies {
+                self.place_link(&own_node_modules, &edge.local_name, &self.virtual_entry_dir(&edge.key))?;
             }
         }
-        let wanted: BTreeSet<&str> = graph.roots.iter().map(|(name, _)| name.as_str()).collect();
-        for key in &graph.roots {
-            self.place_link(&self.node_modules, &key.0, &self.virtual_entry_dir(key))?;
+        let wanted: BTreeSet<&str> = graph.roots.iter().map(|edge| edge.local_name.as_str()).collect();
+        for edge in &graph.roots {
+            self.place_link(&self.node_modules, &edge.local_name, &self.virtual_entry_dir(&edge.key))?;
         }
         self.remove_obsolete_root_links(&wanted)?;
         Ok(())

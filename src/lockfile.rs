@@ -1,4 +1,4 @@
-use crate::resolver::{Graph, PackageKey, ResolvedPackage};
+use crate::resolver::{DependencyEdge, Graph, PackageKey, ResolvedPackage};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -25,7 +25,11 @@ pub struct Lockfile {
 struct DirectDependency {
     /// The range from package.json at lock time, e.g. "^19.0.0".
     range: String,
-    /// The exact version that range resolved to.
+    /// The resolved package's identity as "name@version". Ordinarily this
+    /// starts with the same name as the map key it's stored under, but for
+    /// an npm alias ("local-name": "npm:real-name@range") the two differ —
+    /// storing the full identity (not just a version) is what makes that
+    /// representable at all.
     resolved: String,
 }
 
@@ -35,6 +39,8 @@ struct LockedPackage {
     resolved: String,
     integrity: Option<String>,
     shasum: Option<String>,
+    /// Dependency local name -> resolved "name@version", same alias-aware
+    /// shape as `DirectDependency::resolved`.
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
 }
@@ -44,9 +50,9 @@ impl Lockfile {
         let direct = graph
             .roots
             .iter()
-            .map(|(name, version)| {
-                let range = direct_ranges.get(name).cloned().unwrap_or_default();
-                (name.clone(), DirectDependency { range, resolved: version.clone() })
+            .map(|edge| {
+                let range = direct_ranges.get(&edge.local_name).cloned().unwrap_or_default();
+                (edge.local_name.clone(), DirectDependency { range, resolved: encode_key(&edge.key) })
             })
             .collect();
 
@@ -54,7 +60,8 @@ impl Lockfile {
             .packages
             .iter()
             .map(|(key, pkg)| {
-                let dependencies = pkg.dependencies.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
+                let dependencies =
+                    pkg.dependencies.iter().map(|edge| (edge.local_name.clone(), encode_key(&edge.key))).collect();
                 (
                     encode_key(key),
                     LockedPackage {
@@ -85,7 +92,13 @@ impl Lockfile {
         let mut packages = BTreeMap::new();
         for (key_str, locked) in &self.packages {
             let key = decode_key(key_str)?;
-            let dependencies = locked.dependencies.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
+            let dependencies = locked
+                .dependencies
+                .iter()
+                .map(|(local_name, resolved)| {
+                    Ok(DependencyEdge { local_name: local_name.clone(), key: decode_key(resolved)? })
+                })
+                .collect::<Result<Vec<_>>>()?;
             packages.insert(
                 key,
                 ResolvedPackage {
@@ -96,7 +109,11 @@ impl Lockfile {
                 },
             );
         }
-        let roots = self.direct.iter().map(|(name, dep)| (name.clone(), dep.resolved.clone())).collect();
+        let roots = self
+            .direct
+            .iter()
+            .map(|(local_name, dep)| Ok(DependencyEdge { local_name: local_name.clone(), key: decode_key(&dep.resolved)? }))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Graph { packages, roots })
     }
 
@@ -168,7 +185,10 @@ mod tests {
                 tarball: "https://registry.npmjs.org/debug/-/debug-4.4.3.tgz".into(),
                 integrity: Some("sha512-abc".into()),
                 shasum: None,
-                dependencies: vec![("ms".to_string(), "2.1.3".to_string())],
+                dependencies: vec![DependencyEdge {
+                    local_name: "ms".to_string(),
+                    key: ("ms".to_string(), "2.1.3".to_string()),
+                }],
             },
         );
         packages.insert(
@@ -180,7 +200,13 @@ mod tests {
                 dependencies: vec![],
             },
         );
-        let graph = Graph { packages, roots: vec![("debug".to_string(), "4.4.3".to_string())] };
+        let graph = Graph {
+            packages,
+            roots: vec![DependencyEdge {
+                local_name: "debug".to_string(),
+                key: ("debug".to_string(), "4.4.3".to_string()),
+            }],
+        };
         (direct_ranges, graph)
     }
 
@@ -194,11 +220,52 @@ mod tests {
 
         let rebuilt = reloaded.to_graph().unwrap();
         assert_eq!(rebuilt.packages.len(), 2);
-        assert_eq!(rebuilt.roots, vec![("debug".to_string(), "4.4.3".to_string())]);
-        assert_eq!(rebuilt.packages[&("debug".to_string(), "4.4.3".to_string())].dependencies, vec![(
-            "ms".to_string(),
-            "2.1.3".to_string()
-        )]);
+        assert_eq!(
+            rebuilt.roots,
+            vec![DependencyEdge { local_name: "debug".to_string(), key: ("debug".to_string(), "4.4.3".to_string()) }]
+        );
+        assert_eq!(
+            rebuilt.packages[&("debug".to_string(), "4.4.3".to_string())].dependencies,
+            vec![DependencyEdge { local_name: "ms".to_string(), key: ("ms".to_string(), "2.1.3".to_string()) }]
+        );
+    }
+
+    #[test]
+    fn aliased_dependency_survives_the_roundtrip() {
+        let mut direct_ranges = BTreeMap::new();
+        direct_ranges.insert("web-vitals-soft-navs".to_string(), "npm:web-vitals@6.2.1".to_string());
+
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            ("web-vitals".to_string(), "6.2.1".to_string()),
+            ResolvedPackage {
+                tarball: "https://registry.npmjs.org/web-vitals/-/web-vitals-6.2.1.tgz".into(),
+                integrity: Some("sha512-xyz".into()),
+                shasum: None,
+                dependencies: vec![],
+            },
+        );
+        let graph = Graph {
+            packages,
+            roots: vec![DependencyEdge {
+                local_name: "web-vitals-soft-navs".to_string(),
+                key: ("web-vitals".to_string(), "6.2.1".to_string()),
+            }],
+        };
+
+        let lock = Lockfile::from_graph(&direct_ranges, &graph);
+        let json = serde_json::to_string(&lock).unwrap();
+        let reloaded: Lockfile = serde_json::from_str(&json).unwrap();
+        let rebuilt = reloaded.to_graph().unwrap();
+
+        assert_eq!(
+            rebuilt.roots,
+            vec![DependencyEdge {
+                local_name: "web-vitals-soft-navs".to_string(),
+                key: ("web-vitals".to_string(), "6.2.1".to_string())
+            }]
+        );
+        assert!(rebuilt.packages.contains_key(&("web-vitals".to_string(), "6.2.1".to_string())));
     }
 
     #[test]

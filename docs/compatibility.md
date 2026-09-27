@@ -26,12 +26,19 @@ a native binary (`rolldown`'s platform-specific binding), and nested
   build`). This is a real usability gap, not just a missing nicety — most
   projects invoke tools through npm scripts.
 - **Resolver only understands a subset of npm's version-range grammar.**
-  Exact versions, `^`, `~`, comparator operators, and `*` work (anything
-  `semver::VersionReq` parses). Not supported: space-separated comparator
-  sets (`">= 2.1.2 < 3"`, which real packages use — `express`'s
-  `safer-buffer` dependency hit this during benchmarking), hyphen ranges
-  (`"1.2.3 - 2.3.4"`), OR ranges (`"1.x || 2.x"`), and dist-tags like
+  Exact versions, `^`, `~`, comparator operators, `*`, and OR ranges
+  (`"^0.28.0 || ^0.29.0"`, split on `||` and matched against either side —
+  this is what `kysely`'s peerDependencies use in real projects) all work.
+  Not supported: space-separated comparator sets (`">= 2.1.2 < 3"`, which
+  real packages use — `express`'s `safer-buffer` dependency hit this during
+  benchmarking), hyphen ranges (`"1.2.3 - 2.3.4"`), and dist-tags like
   `"latest"`. See `src/resolver.rs::pick_version`.
+- **npm dependency aliases are supported**
+  (`"local-name": "npm:real-name@range"`, e.g. `posthog-js`'s
+  `"web-vitals-soft-navs": "npm:web-vitals@6.2.1"`). The resolver fetches
+  and resolves the real package, and the linker places it under the alias's
+  local name so `require('local-name')` gets the aliased package. See
+  `resolver::DependencyEdge` and `resolver::Resolver::resolve_alias`.
 - **Lifecycle scripts (`postinstall` etc.) are never executed.** This is a
   deliberate, documented policy (PRD §16.3, §30: "disabled by default"), not
   an oversight — but it means packages that rely on a build step at install

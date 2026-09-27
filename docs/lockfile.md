@@ -11,7 +11,11 @@ never rewritten) when `--frozen` is passed.
   "direct": {
     "debug": {
       "range": "^4.3.0",
-      "resolved": "4.4.3"
+      "resolved": "debug@4.4.3"
+    },
+    "web-vitals-soft-navs": {
+      "range": "npm:web-vitals@6.2.1",
+      "resolved": "web-vitals@6.2.1"
     }
   },
   "packages": {
@@ -21,12 +25,19 @@ never rewritten) when `--frozen` is passed.
       "integrity": "sha512-...",
       "shasum": null,
       "dependencies": {
-        "ms": "2.1.3"
+        "ms": "ms@2.1.3"
       }
     },
     "ms@2.1.3": {
       "version": "2.1.3",
       "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+      "integrity": "sha512-...",
+      "shasum": null,
+      "dependencies": {}
+    },
+    "web-vitals@6.2.1": {
+      "version": "6.2.1",
+      "resolved": "https://registry.npmjs.org/web-vitals/-/web-vitals-6.2.1.tgz",
       "integrity": "sha512-...",
       "shasum": null,
       "dependencies": {}
@@ -43,17 +54,23 @@ never rewritten) when `--frozen` is passed.
   ever been one version.
 - **`direct`** — the project's own dependencies (from both `dependencies` and
   `devDependencies`) as they were when this lockfile was written: the range
-  requested, and the exact version it resolved to. `install` recomputes the
-  current ranges from `package.json` and compares them against this map
-  (`Lockfile::matches_manifest`) — any difference (added, removed, or
-  changed range) means the lockfile is stale and gets ignored (or, under
-  `--frozen`, gets treated as an error instead of a silent re-resolve).
+  requested, and the resolved package's identity as `"name@version"`.
+  `install` recomputes the current ranges from `package.json` and compares
+  them against this map (`Lockfile::matches_manifest`) — any difference
+  (added, removed, or changed range) means the lockfile is stale and gets
+  ignored (or, under `--frozen`, gets treated as an error instead of a
+  silent re-resolve).
 - **`packages`** — every resolved package in the graph, keyed by
   `"name@version"` (scoped packages keep their `@scope/name@version` form
   intact — the key is split on the *last* `@`, so this is unambiguous).
-  `dependencies` here are that package's own direct dependency edges,
-  already resolved to exact versions — this is what lets
-  `Lockfile::to_graph` rebuild the full graph with zero registry calls.
+  `dependencies` here maps each dependency's *local* name (what it's
+  required/linked as) to the real resolved package's `"name@version"`
+  identity — this is what lets `Lockfile::to_graph` rebuild the full graph,
+  including npm dependency aliases, with zero registry calls. For an
+  ordinary (non-aliased) dependency the local name and the resolved
+  package's name are the same, as with `debug`'s dependency on `ms` above;
+  `web-vitals-soft-navs` is the aliased case (`"local-name": "npm:real-name@range"`
+  in package.json — see `docs/compatibility.md`), where they differ.
 
 ## What's deliberately not in here (yet)
 

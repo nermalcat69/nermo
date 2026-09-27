@@ -51,7 +51,15 @@ impl Client {
     pub fn new() -> Result<Self> {
         let http = reqwest::blocking::Client::builder()
             .user_agent(concat!("nermo/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(30))
+            // A long-lived, widely-depended-on package (e.g. `wrangler`) can
+            // have hundreds of published versions each listing dozens of
+            // dependencies; even npm's abbreviated metadata format for that
+            // is tens of MB. Tarballs for native-heavy packages can be large
+            // too. 30s was tuned for a fast connection and a small package;
+            // a real timeout should only fire when nothing is happening at
+            // all, not when a large-but-progressing transfer is slow.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(180))
             .build()
             .context("building HTTP client")?;
         Ok(Self { http, registry: DEFAULT_REGISTRY.to_string() })
