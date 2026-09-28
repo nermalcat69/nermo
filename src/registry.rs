@@ -51,6 +51,11 @@ pub struct VersionMetadata {
     /// defaults to the package's own unscoped name) or a name->path map.
     #[serde(default, rename = "bin")]
     pub bin_field: Option<BinField>,
+    /// npm's `peerDependencies`: not fetched/resolved independently (see
+    /// `Resolver::link_peer_dependencies`) — only linked to an already-
+    /// resolved compatible version elsewhere in the graph, same as pnpm.
+    #[serde(default, rename = "peerDependencies")]
+    pub peer_dependencies: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +211,7 @@ mod tests {
             os: None,
             cpu: None,
             bin_field,
+            peer_dependencies: BTreeMap::new(),
         }
     }
 

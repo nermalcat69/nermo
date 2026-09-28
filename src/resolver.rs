@@ -63,6 +63,12 @@ pub struct ResolvedPackage {
     /// npm package.json `bin` entries: shim name -> script path relative to
     /// the package root. Empty for the vast majority of packages.
     pub bin: BTreeMap<String, String>,
+    /// npm's `peerDependencies`, used only transiently by
+    /// `link_peer_dependencies` right after resolution finishes — by the
+    /// time this graph is persisted to a lockfile, any peer that could be
+    /// linked is already folded into `dependencies`, so this never needs
+    /// to round-trip through the lockfile itself.
+    pub peer_dependencies: BTreeMap<String, String>,
 }
 
 /// The complete dependency graph: every resolved package keyed by
@@ -161,8 +167,62 @@ impl<'a> Resolver<'a> {
         let items: Vec<DepEdge> =
             direct.iter().map(|(name, range)| DepEdge::Required(name.clone(), range.clone())).collect();
         let roots = self.fan_out(&items)?;
+        self.link_peer_dependencies();
         let packages = self.packages.into_inner().unwrap();
         Ok(Graph { packages, roots })
+    }
+
+    /// After the full graph is resolved, wire each package's
+    /// `peerDependencies` to an already-resolved compatible version
+    /// elsewhere in the graph, same as pnpm's peer-linking. A peer that
+    /// isn't already satisfied by something in the project is left
+    /// unresolved (advisory, matching real-world peer semantics) rather
+    /// than triggering an independent fresh resolution: a version nermo
+    /// picked on its own has no guarantee of being the one the rest of the
+    /// project actually uses, and the common real case (confirmed against
+    /// a real project) is that the peer is already a direct or transitive
+    /// dependency.
+    ///
+    /// This is what makes a package like `@posthog/react` (which only
+    /// requires `posthog-js` as a peer, not a regular dependency) a
+    /// correct non-leaf: without this, it had zero resolved dependency
+    /// edges, so the linker's leaf shortcut symlinked it straight to the
+    /// immutable store — where its own `import 'posthog-js'` then resolved
+    /// via the *store's* real path instead of the project's node_modules,
+    /// exactly the realpath-breaks-nested-resolution problem the
+    /// leaf/virtual-store split exists to avoid in the first place.
+    fn link_peer_dependencies(&self) {
+        let pending: Vec<(PackageKey, String, String)> = {
+            let packages = self.packages.lock().unwrap();
+            packages
+                .iter()
+                .flat_map(|(key, pkg)| {
+                    pkg.peer_dependencies.iter().filter_map(move |(name, range)| {
+                        if pkg.dependencies.iter().any(|e| &e.local_name == name) {
+                            None // already a real dependency edge too
+                        } else {
+                            Some((key.clone(), name.clone(), range.clone()))
+                        }
+                    })
+                })
+                .collect()
+        };
+
+        let resolved: Vec<(PackageKey, DependencyEdge)> = pending
+            .into_iter()
+            .filter_map(|(key, name, range)| {
+                self.find_reusable_version(&name, &range).map(|peer_key| {
+                    (key, DependencyEdge { local_name: name, key: peer_key })
+                })
+            })
+            .collect();
+
+        let mut packages = self.packages.lock().unwrap();
+        for (key, edge) in resolved {
+            if let Some(pkg) = packages.get_mut(&key) {
+                pkg.dependencies.push(edge);
+            }
+        }
     }
 
     /// npm dependency aliases look like `"local-name": "npm:real-name@range"`
@@ -282,6 +342,7 @@ impl<'a> Resolver<'a> {
         let mut packages = self.packages.lock().unwrap();
         let entry = packages.get_mut(&key).expect("just inserted");
         entry.bin = vmeta.bin_entries();
+        entry.peer_dependencies = vmeta.peer_dependencies.clone();
         entry.tarball = vmeta.dist.tarball;
         entry.integrity = vmeta.dist.integrity;
         entry.shasum = vmeta.dist.shasum;
@@ -454,6 +515,7 @@ mod tests {
                             os: None,
                             cpu: None,
                             bin_field: None,
+                            peer_dependencies: BTreeMap::new(),
                         },
                     )
                 })
@@ -516,6 +578,74 @@ mod tests {
             Some(("esbuild-darwin-arm64".to_string(), "0.28.1".to_string()))
         );
         assert!(resolver.find_reusable_version("esbuild-darwin-arm64", "0.28.2").is_none());
+    }
+
+    #[test]
+    fn link_peer_dependencies_wires_a_peer_already_resolved_elsewhere() {
+        let client = Client::new().unwrap();
+        let resolver = Resolver::new(&client);
+        {
+            let mut packages = resolver.packages.lock().unwrap();
+            // The real repro: @posthog/react only lists posthog-js as a
+            // peer, not a regular dependency, so it starts with zero
+            // dependency edges (a false "leaf").
+            packages.insert(
+                ("@posthog/react".to_string(), "1.11.2".to_string()),
+                ResolvedPackage {
+                    peer_dependencies: BTreeMap::from([("posthog-js".to_string(), "^1.0.0".to_string())]),
+                    ..Default::default()
+                },
+            );
+            packages.insert(("posthog-js".to_string(), "1.434.15".to_string()), ResolvedPackage::default());
+        }
+
+        resolver.link_peer_dependencies();
+
+        let packages = resolver.packages.lock().unwrap();
+        let pkg = &packages[&("@posthog/react".to_string(), "1.11.2".to_string())];
+        assert_eq!(pkg.dependencies.len(), 1);
+        assert_eq!(pkg.dependencies[0].local_name, "posthog-js");
+        assert_eq!(pkg.dependencies[0].key, ("posthog-js".to_string(), "1.434.15".to_string()));
+    }
+
+    #[test]
+    fn link_peer_dependencies_leaves_an_unmet_peer_unresolved() {
+        let client = Client::new().unwrap();
+        let resolver = Resolver::new(&client);
+        resolver.packages.lock().unwrap().insert(
+            ("some-plugin".to_string(), "1.0.0".to_string()),
+            ResolvedPackage {
+                peer_dependencies: BTreeMap::from([("react".to_string(), "^19.0.0".to_string())]),
+                ..Default::default()
+            },
+        );
+
+        resolver.link_peer_dependencies();
+
+        let packages = resolver.packages.lock().unwrap();
+        assert!(packages[&("some-plugin".to_string(), "1.0.0".to_string())].dependencies.is_empty());
+    }
+
+    #[test]
+    fn link_peer_dependencies_does_not_duplicate_an_existing_real_dependency_edge() {
+        let client = Client::new().unwrap();
+        let resolver = Resolver::new(&client);
+        resolver.packages.lock().unwrap().insert(
+            ("some-lib".to_string(), "1.0.0".to_string()),
+            ResolvedPackage {
+                dependencies: vec![DependencyEdge {
+                    local_name: "shared".to_string(),
+                    key: ("shared".to_string(), "1.0.0".to_string()),
+                }],
+                peer_dependencies: BTreeMap::from([("shared".to_string(), "^1.0.0".to_string())]),
+                ..Default::default()
+            },
+        );
+
+        resolver.link_peer_dependencies();
+
+        let packages = resolver.packages.lock().unwrap();
+        assert_eq!(packages[&("some-lib".to_string(), "1.0.0".to_string())].dependencies.len(), 1);
     }
 
     #[test]
