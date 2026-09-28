@@ -63,6 +63,12 @@ pub struct ResolvedPackage {
     /// npm package.json `bin` entries: shim name -> script path relative to
     /// the package root. Empty for the vast majority of packages.
     pub bin: BTreeMap<String, String>,
+    /// `peerDependencies` marked `optional: true` in `peerDependenciesMeta`.
+    /// Transient — used only by `link_optional_peer_dependencies` right
+    /// after resolution finishes; already folded into `dependencies` by
+    /// the time a graph is persisted, so it never needs to round-trip
+    /// through the lockfile.
+    pub optional_peer_dependencies: BTreeMap<String, String>,
 }
 
 /// The complete dependency graph: every resolved package keyed by
@@ -106,15 +112,6 @@ enum DepEdge {
     /// "required" in the npm sense, real tools don't hard-fail an install
     /// over an unmet peer.
     Peer(String, String),
-    /// A `peerDependencies` entry marked `optional: true` in
-    /// `peerDependenciesMeta` — only ever linked to an already-resolved
-    /// version elsewhere in the graph, never independently fetched.
-    /// Packages that support several interchangeable drivers/integrations
-    /// (drizzle-orm listing pg/mysql2/better-sqlite3/... as peers) mark
-    /// every one of them this way specifically so tools *don't* install
-    /// all of them; treating these like `Peer` blew a real project's
-    /// graph from 456 to 2510 packages.
-    OptionalPeer(String, String),
 }
 
 impl<'a> Resolver<'a> {
@@ -179,8 +176,61 @@ impl<'a> Resolver<'a> {
         let items: Vec<DepEdge> =
             direct.iter().map(|(name, range)| DepEdge::Required(name.clone(), range.clone())).collect();
         let roots = self.fan_out(&items)?;
+        self.link_optional_peer_dependencies();
         let packages = self.packages.into_inner().unwrap();
         Ok(Graph { packages, roots })
+    }
+
+    /// Link each package's optional peers (`peerDependenciesMeta.optional:
+    /// true`) to an already-resolved compatible version elsewhere in the
+    /// graph, once the *entire* graph is done resolving — not inline
+    /// during `fan_out`.
+    ///
+    /// This has to be a post-pass, not part of the same concurrent
+    /// resolution `Peer` edges go through: two sibling branches can both
+    /// need the same package, one as a required peer (which fetches it
+    /// fresh) and one as an optional peer (which only ever links an
+    /// existing one). `fan_out` resolves items concurrently with no
+    /// ordering guarantee between branches, so if the optional-peer branch
+    /// happened to run first, an inline check would see nothing yet and
+    /// give up permanently — a real race hit against this exact project:
+    /// `@better-auth/core` needs `kysely` as a *required* peer (fetches it
+    /// fine), while `@better-auth/kysely-adapter` needs the same `kysely`
+    /// as an *optional* one; depending on scheduling, the adapter's check
+    /// could run before `@better-auth/core`'s had finished, permanently
+    /// missing a `kysely` that the very same install was already fetching.
+    /// Waiting for the whole graph to settle before linking optional peers
+    /// removes that race entirely.
+    fn link_optional_peer_dependencies(&self) {
+        let pending: Vec<(PackageKey, String, String)> = {
+            let packages = self.packages.lock().unwrap();
+            packages
+                .iter()
+                .flat_map(|(key, pkg)| {
+                    pkg.optional_peer_dependencies.iter().filter_map(move |(name, range)| {
+                        if pkg.dependencies.iter().any(|e| &e.local_name == name) {
+                            None // already a real dependency edge too
+                        } else {
+                            Some((key.clone(), name.clone(), range.clone()))
+                        }
+                    })
+                })
+                .collect()
+        };
+
+        let resolved: Vec<(PackageKey, DependencyEdge)> = pending
+            .into_iter()
+            .filter_map(|(key, name, range)| {
+                self.find_reusable_version(&name, &range).map(|peer_key| (key, DependencyEdge { local_name: name, key: peer_key }))
+            })
+            .collect();
+
+        let mut packages = self.packages.lock().unwrap();
+        for (key, edge) in resolved {
+            if let Some(pkg) = packages.get_mut(&key) {
+                pkg.dependencies.push(edge);
+            }
+        }
     }
 
     /// npm dependency aliases look like `"local-name": "npm:real-name@range"`
@@ -233,9 +283,6 @@ impl<'a> Resolver<'a> {
                 DepEdge::Peer(local_name, range) => self
                     .resolve_one(local_name, range)
                     .ok()
-                    .map(|key| DependencyEdge { local_name: local_name.clone(), key }),
-                DepEdge::OptionalPeer(local_name, range) => self
-                    .find_reusable_version(local_name, range)
                     .map(|key| DependencyEdge { local_name: local_name.clone(), key }),
             };
             if let Some(edge) = edge {
@@ -302,25 +349,29 @@ impl<'a> Resolver<'a> {
                 .map(|(n, r)| DepEdge::Required(n.clone(), r.clone())),
         );
         items.extend(vmeta.optional_dependencies.iter().map(|(n, r)| DepEdge::Optional(n.clone(), r.clone())));
-        items.extend(
-            vmeta
-                .peer_dependencies
-                .iter()
-                .filter(|(n, _)| !vmeta.dependencies.contains_key(*n) && !vmeta.optional_dependencies.contains_key(*n))
-                .map(|(n, r)| {
-                    let optional = vmeta.peer_dependencies_meta.get(n).is_some_and(|m| m.optional);
-                    if optional {
-                        DepEdge::OptionalPeer(n.clone(), r.clone())
-                    } else {
-                        DepEdge::Peer(n.clone(), r.clone())
-                    }
-                }),
-        );
+        // Required (not marked optional in peerDependenciesMeta) peers go
+        // through fan_out inline like a real dependency: they're
+        // self-sufficient (fetch fresh if unmet) so there's no ordering
+        // concern. Optional peers are deliberately NOT turned into edges
+        // here — see `link_optional_peer_dependencies` for why they need a
+        // post-pass instead of being resolved inline.
+        let mut optional_peer_dependencies = BTreeMap::new();
+        for (n, r) in &vmeta.peer_dependencies {
+            if vmeta.dependencies.contains_key(n) || vmeta.optional_dependencies.contains_key(n) {
+                continue;
+            }
+            if vmeta.peer_dependencies_meta.get(n).is_some_and(|m| m.optional) {
+                optional_peer_dependencies.insert(n.clone(), r.clone());
+            } else {
+                items.push(DepEdge::Peer(n.clone(), r.clone()));
+            }
+        }
         let edges = self.fan_out(&items)?;
 
         let mut packages = self.packages.lock().unwrap();
         let entry = packages.get_mut(&key).expect("just inserted");
         entry.bin = vmeta.bin_entries();
+        entry.optional_peer_dependencies = optional_peer_dependencies;
         entry.tarball = vmeta.dist.tarball;
         entry.integrity = vmeta.dist.integrity;
         entry.shasum = vmeta.dist.shasum;
@@ -351,10 +402,18 @@ impl<'a> Resolver<'a> {
             return candidates.find(|(_, v)| *v == exact).cloned();
         }
 
-        let req = VersionReq::parse(range).ok()?;
+        // Same OR-range splitting pick_version does ("^0.28.17 || ^0.29.0"
+        // is common, e.g. real peerDependencies ranges) — semver's own
+        // VersionReq::parse doesn't understand "||" at all, so without this
+        // split, every reuse check against an OR range silently failed to
+        // match anything real, even an exact, already-resolved version.
+        let reqs: Vec<VersionReq> = range.split("||").filter_map(|part| VersionReq::parse(part.trim()).ok()).collect();
+        if reqs.is_empty() {
+            return None;
+        }
         candidates
             .filter_map(|key| Version::parse(&key.1).ok().map(|parsed| (key.clone(), parsed)))
-            .filter(|(_, parsed)| req.matches(parsed))
+            .filter(|(_, parsed)| reqs.iter().any(|req| req.matches(parsed)))
             .max_by(|a, b| a.1.cmp(&b.1))
             .map(|(key, _)| key)
     }
@@ -560,6 +619,27 @@ mod tests {
     }
 
     #[test]
+    fn find_reusable_version_supports_or_ranges() {
+        let client = Client::new().unwrap();
+        let resolver = Resolver::new(&client);
+        resolver
+            .packages
+            .lock()
+            .unwrap()
+            .insert(("kysely".to_string(), "0.29.6".to_string()), ResolvedPackage::default());
+
+        // The real @better-auth/kysely-adapter peer range. VersionReq::parse
+        // has no idea what "||" means, so before this fix the whole range
+        // failed to parse and silently matched nothing, even an
+        // already-resolved exact match.
+        assert_eq!(
+            resolver.find_reusable_version("kysely", "^0.28.17 || ^0.29.0"),
+            Some(("kysely".to_string(), "0.29.6".to_string()))
+        );
+        assert!(resolver.find_reusable_version("kysely", "^0.20.0 || ^0.21.0").is_none());
+    }
+
+    #[test]
     fn peer_edge_reuses_an_already_resolved_compatible_version() {
         let client = Client::new().unwrap();
         let resolver = Resolver::new(&client);
@@ -582,29 +662,66 @@ mod tests {
     }
 
     #[test]
-    fn optional_peer_edge_links_when_already_resolved_but_never_fetches_fresh() {
+    fn link_optional_peer_dependencies_links_when_already_resolved_but_never_fetches_fresh() {
         let client = Client::new().unwrap();
         let resolver = Resolver::new(&client);
-        resolver
-            .packages
-            .lock()
-            .unwrap()
-            .insert(("pg".to_string(), "8.11.6".to_string()), ResolvedPackage::default());
+        {
+            let mut packages = resolver.packages.lock().unwrap();
+            // pg is already resolved elsewhere in the graph for real.
+            packages.insert(("pg".to_string(), "8.11.6".to_string()), ResolvedPackage::default());
+            // drizzle-orm-shaped case: two optional peers, one satisfiable
+            // (pg), one genuinely absent from the whole project (mysql2).
+            packages.insert(
+                ("drizzle-orm".to_string(), "0.45.3".to_string()),
+                ResolvedPackage {
+                    optional_peer_dependencies: BTreeMap::from([
+                        ("pg".to_string(), "^8.0.0".to_string()),
+                        ("mysql2".to_string(), "^3.0.0".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            );
+        }
 
-        // Present in the graph already (some other package really uses pg):
-        // OptionalPeer links it, exactly like a real peer would.
-        let linked = resolver.fan_out(&[DepEdge::OptionalPeer("pg".to_string(), "^8.0.0".to_string())]).unwrap();
-        assert_eq!(linked.len(), 1);
-        assert_eq!(linked[0].key, ("pg".to_string(), "8.11.6".to_string()));
+        resolver.link_optional_peer_dependencies();
 
-        // Not present at all (the real drizzle-orm case: mysql2, sqlite,
-        // etc. are all listed as optional peers but the project uses none
-        // of them): must resolve to nothing. OptionalPeer's fan_out arm
-        // only ever calls find_reusable_version (no metadata fetch, no
-        // network I/O at all), so an unmet one is structurally guaranteed
-        // to never trigger an independent download.
-        let unmet = resolver.fan_out(&[DepEdge::OptionalPeer("mysql2".to_string(), "^3.0.0".to_string())]).unwrap();
-        assert!(unmet.is_empty());
+        let packages = resolver.packages.lock().unwrap();
+        let pkg = &packages[&("drizzle-orm".to_string(), "0.45.3".to_string())];
+        assert_eq!(pkg.dependencies.len(), 1, "only the satisfiable optional peer should be linked");
+        assert_eq!(pkg.dependencies[0].local_name, "pg");
+        assert_eq!(pkg.dependencies[0].key, ("pg".to_string(), "8.11.6".to_string()));
+    }
+
+    #[test]
+    fn link_optional_peer_dependencies_runs_after_the_whole_graph_settles() {
+        // Reproduces the real race this post-pass exists to avoid:
+        // @better-auth/core resolves kysely as a *required* peer;
+        // @better-auth/kysely-adapter needs the same kysely as an
+        // *optional* one. Even if the adapter's package entry existed
+        // before kysely itself was inserted into the graph, the post-pass
+        // (run once after fan_out fully completes) must still find it.
+        let client = Client::new().unwrap();
+        let resolver = Resolver::new(&client);
+        {
+            let mut packages = resolver.packages.lock().unwrap();
+            packages.insert(
+                ("@better-auth/kysely-adapter".to_string(), "1.7.6".to_string()),
+                ResolvedPackage {
+                    optional_peer_dependencies: BTreeMap::from([("kysely".to_string(), "^0.28.17 || ^0.29.0".to_string())]),
+                    ..Default::default()
+                },
+            );
+            // Inserted after the adapter's own entry, simulating the real
+            // race: a concurrent sibling branch finishing later.
+            packages.insert(("kysely".to_string(), "0.29.6".to_string()), ResolvedPackage::default());
+        }
+
+        resolver.link_optional_peer_dependencies();
+
+        let packages = resolver.packages.lock().unwrap();
+        let pkg = &packages[&("@better-auth/kysely-adapter".to_string(), "1.7.6".to_string())];
+        assert_eq!(pkg.dependencies.len(), 1);
+        assert_eq!(pkg.dependencies[0].key, ("kysely".to_string(), "0.29.6".to_string()));
     }
 
     #[test]

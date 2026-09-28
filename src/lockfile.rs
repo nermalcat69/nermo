@@ -123,6 +123,7 @@ impl Lockfile {
                     shasum: locked.shasum.clone(),
                     dependencies,
                     bin: locked.bin.clone(),
+                    optional_peer_dependencies: BTreeMap::new(),
                 },
             );
         }
@@ -220,6 +221,7 @@ mod tests {
                     key: ("ms".to_string(), "2.1.3".to_string()),
                 }],
                 bin: BTreeMap::new(),
+                optional_peer_dependencies: BTreeMap::new(),
             },
         );
         packages.insert(
@@ -230,6 +232,7 @@ mod tests {
                 shasum: None,
                 dependencies: vec![],
                 bin: BTreeMap::new(),
+                optional_peer_dependencies: BTreeMap::new(),
             },
         );
         let graph = Graph {
@@ -276,6 +279,7 @@ mod tests {
                 shasum: None,
                 dependencies: vec![],
                 bin: BTreeMap::new(),
+                optional_peer_dependencies: BTreeMap::new(),
             },
         );
         let graph = Graph {
