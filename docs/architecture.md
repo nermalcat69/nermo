@@ -83,7 +83,11 @@ small `concurrency::parallel_for_each` helper — no new dependency, no
 executor to configure. The resolver also persists fetched registry metadata
 to `store/cache/registry/` (TTL-based, `Resolver::with_disk_cache`) so a
 second project resolving a shared package skips the registry round trip
-entirely, not just the store/download step. See `docs/performance.md` for
+entirely, not just the store/download step. That cache doesn't grow
+forever: `Store::open` runs a throttled (once a day at most) sweep
+deleting any entry not refreshed in 30 days — a project nobody's touched
+in a month shouldn't leave its packages' metadata sitting on disk
+indefinitely. See `docs/performance.md` for
 measurements, including a case where raising concurrency further was tested
 and found *not* to help (the graph's depth, and the sheer count of
 platform-variant `optionalDependencies` fetches for native-heavy stacks, not

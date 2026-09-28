@@ -23,7 +23,62 @@ impl Store {
         fs::create_dir_all(root.join("temporary")).context("creating store/temporary")?;
         let store = Self { root };
         store.repair_legacy_permissions_once()?;
+        store.sweep_stale_registry_cache();
         Ok(store)
+    }
+
+    /// Delete registry metadata cache entries (`cache/registry/*.json`)
+    /// that haven't been refreshed in `CACHE_MAX_AGE_SECS` — a project
+    /// nobody's touched in a month shouldn't leave its packages' cached
+    /// metadata sitting on disk forever. `fetched_at_unix` is a good proxy
+    /// for "last actually used": the cache's own TTL (an hour) means any
+    /// package genuinely still in use gets refetched, and so re-stamped,
+    /// far more often than this threshold.
+    ///
+    /// Throttled by its own marker (separate from the permissions-repair
+    /// one) so this is a cheap single-file timestamp check on every
+    /// command, not a directory walk — the real walk only happens once
+    /// this interval has actually elapsed. Best-effort: any error here
+    /// (unreadable file, bad JSON, ...) just skips that entry rather than
+    /// failing the install this is running alongside.
+    fn sweep_stale_registry_cache(&self) {
+        const SWEEP_INTERVAL_SECS: u64 = 24 * 60 * 60;
+        const MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+        const MARKER: &str = "cache/.last-sweep";
+
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else { return };
+        let now = now.as_secs();
+
+        let marker = self.root.join(MARKER);
+        if let Ok(text) = fs::read_to_string(&marker) {
+            if let Ok(last_swept) = text.trim().parse::<u64>() {
+                if now.saturating_sub(last_swept) < SWEEP_INTERVAL_SECS {
+                    return;
+                }
+            }
+        }
+
+        if let Ok(entries) = fs::read_dir(self.root.join("cache").join("registry")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let stale = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                    .and_then(|v| v.get("fetched_at_unix").and_then(|f| f.as_u64()))
+                    .is_some_and(|fetched_at| now.saturating_sub(fetched_at) > MAX_AGE_SECS);
+                if stale {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+
+        if let Some(parent) = marker.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&marker, now.to_string());
     }
 
     /// One-time migration for a store populated before `lock_permissions`
@@ -403,6 +458,47 @@ mod tests {
             0,
             "second call should be a no-op (marker already present)"
         );
+    }
+
+    #[test]
+    fn sweep_stale_registry_cache_deletes_only_entries_older_than_the_threshold() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store_at(root.path());
+        let cache_dir = store.root.join("cache").join("registry");
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let stale = cache_dir.join("abandoned-package.json");
+        let fresh = cache_dir.join("actively-used-package.json");
+        fs::write(&stale, format!(r#"{{"fetched_at_unix":{},"metadata":{{"versions":{{}}}}}}"#, now - 40 * 24 * 60 * 60)).unwrap();
+        fs::write(&fresh, format!(r#"{{"fetched_at_unix":{},"metadata":{{"versions":{{}}}}}}"#, now - 60)).unwrap();
+
+        store.sweep_stale_registry_cache();
+
+        assert!(!stale.exists(), "entry unused for 40 days should be evicted");
+        assert!(fresh.exists(), "recently-used entry must survive");
+    }
+
+    #[test]
+    fn sweep_stale_registry_cache_is_throttled_and_does_not_resweep_immediately() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store_at(root.path());
+        let cache_dir = store.root.join("cache").join("registry");
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let stale = cache_dir.join("old-package.json");
+        fs::write(&stale, format!(r#"{{"fetched_at_unix":{},"metadata":{{"versions":{{}}}}}}"#, now - 40 * 24 * 60 * 60)).unwrap();
+
+        store.sweep_stale_registry_cache();
+        assert!(!stale.exists());
+
+        // A fresh entry arriving right after the sweep must survive a
+        // second call made immediately after — the sweep should be
+        // throttled by its own marker, not re-walk the directory.
+        fs::write(&stale, format!(r#"{{"fetched_at_unix":{},"metadata":{{"versions":{{}}}}}}"#, now - 40 * 24 * 60 * 60)).unwrap();
+        store.sweep_stale_registry_cache();
+        assert!(stale.exists(), "immediate re-sweep should be throttled by the marker");
     }
 
     #[test]
