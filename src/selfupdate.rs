@@ -74,7 +74,22 @@ fn fetch_latest_release(timeout: Duration) -> Result<Release> {
 /// is swallowed silently — this must never fail or slow down the command
 /// it's piggybacking on. Prints to stderr, not stdout, so it never pollutes
 /// piped/scripted output.
+/// True in essentially every CI/deployment platform (GitHub Actions,
+/// Vercel, Cloudflare Pages, CircleCI, GitLab CI, Travis, ... all set the
+/// generic `CI` variable; `NERMO_NO_UPDATE_CHECK` is an explicit escape
+/// hatch for anything that doesn't). A fresh CI container has no persisted
+/// nermo store, so `notify_if_update_available`'s own 24h cache never gets
+/// to help there — every run would otherwise pay a real GitHub API round
+/// trip for a notice nobody in an automated deploy is going to read or act
+/// on. Update notices stay meant for an interactive terminal.
+fn should_skip_update_check() -> bool {
+    std::env::var_os("CI").is_some() || std::env::var_os("NERMO_NO_UPDATE_CHECK").is_some()
+}
+
 pub fn notify_if_update_available() {
+    if should_skip_update_check() {
+        return;
+    }
     let Ok(store) = crate::store::Store::open() else { return };
     let cache_path = store.root().join("metadata").join("update-check.json");
 
