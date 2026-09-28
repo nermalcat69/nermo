@@ -379,6 +379,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn repair_legacy_permissions_once_fixes_pre_existing_files_and_only_runs_once() {
         use std::os::unix::fs::PermissionsExt;
 
