@@ -21,7 +21,38 @@ impl Store {
         let root = default_root()?;
         fs::create_dir_all(root.join("packages")).context("creating store/packages")?;
         fs::create_dir_all(root.join("temporary")).context("creating store/temporary")?;
-        Ok(Self { root })
+        let store = Self { root };
+        store.repair_legacy_permissions_once()?;
+        Ok(store)
+    }
+
+    /// One-time migration for a store populated before `lock_permissions`
+    /// switched from 0o444 to 0o555: that content is still missing the
+    /// execute bit, which broke not just `.bin` shims but any package that
+    /// spawns its own bundled native binary directly (wrangler -> workerd
+    /// hit exactly this, with EACCES). Marker-gated so the full walk only
+    /// ever runs once per store, not on every command.
+    #[cfg(unix)]
+    fn repair_legacy_permissions_once(&self) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        const MARKER: &str = ".nermo-permissions-v2";
+        let marker = self.root.join(MARKER);
+        if marker.is_file() {
+            return Ok(());
+        }
+        for entry in walkdir::WalkDir::new(self.root.join("packages")) {
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().is_file() {
+                let _ = fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o555));
+            }
+        }
+        fs::write(&marker, "").context("writing permissions-repair marker")?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn repair_legacy_permissions_once(&self) -> Result<()> {
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -345,6 +376,32 @@ mod tests {
     fn store_at(root: &Path) -> Store {
         fs::create_dir_all(root.join("temporary")).unwrap();
         Store { root: root.to_path_buf() }
+    }
+
+    #[test]
+    fn repair_legacy_permissions_once_fixes_pre_existing_files_and_only_runs_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let store = store_at(root.path());
+        let file = store.root.join("packages/demo/1.0.0/bin.js");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "#!/usr/bin/env node").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+
+        store.repair_legacy_permissions_once().unwrap();
+        assert_ne!(fs::metadata(&file).unwrap().permissions().mode() & 0o111, 0);
+
+        // Simulate new, correctly-permissioned content arriving after the
+        // one-time repair: a second call must not touch it (it should be a
+        // no-op past the marker, not a repeat full-store walk).
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+        store.repair_legacy_permissions_once().unwrap();
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o111,
+            0,
+            "second call should be a no-op (marker already present)"
+        );
     }
 
     #[test]
