@@ -45,6 +45,7 @@ nermo fetch react@19.0.0 # ensure one package version is in the store, without i
 nermo store               # show store stats (packages, disk usage, tracked projects)
 nermo store prune         # remove packages no tracked project references (supports --dry-run, --yes)
 nermo doctor              # diagnose store/registry/project/lockfile/symlink problems
+nermo lockfile            # print .nermo-lock as readable JSON (it's zstd-compressed on disk)
 nermo upgrade             # download and install the latest release over the running binary
 nermo dev                 # run package.json's "scripts.dev" (nermo <script> == npm run <script>)
 ```

@@ -1,9 +1,19 @@
 # `.nermo-lock` format
 
-JSON, schema version 1. Written by `nermo install` whenever it resolves
-fresh (i.e. no existing lockfile matched `package.json`); read by every
-`install` to decide whether resolution can be skipped, and required (and
-never rewritten) when `--frozen` is passed.
+JSON, schema version 2, **zstd-compressed on disk** (level 19 — written
+once per install and read once, so trading write speed for size is a clean
+win on a lockfile that can otherwise run to hundreds of KB for a large real
+project). Written by `nermo install` whenever it resolves fresh (i.e. no
+existing lockfile matched `package.json`); read by every `install` to
+decide whether resolution can be skipped, and required (and never
+rewritten) when `--frozen` is passed.
+
+The file isn't meant to be opened directly — run `nermo lockfile` to print
+it as the readable JSON shown below. Because it's compressed, an old
+(schema version 1, uncompressed) lockfile or a genuinely corrupt one both
+fail to decompress and produce the same "delete it and reinstall" error
+`load` already gives for a schema mismatch, rather than a confusing parse
+error.
 
 ```json
 {

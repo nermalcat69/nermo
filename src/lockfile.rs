@@ -139,13 +139,20 @@ impl Lockfile {
         project_root.join(FILE_NAME)
     }
 
+    /// A real project's lockfile is one JSON object per resolved package;
+    /// on disk it's zstd-compressed (level 19 — this is written once per
+    /// install and read once, so trading write speed for size is a clean
+    /// win) so it doesn't dominate a diff or a directory listing the way an
+    /// uncompressed multi-hundred-package lockfile does. Never meant to be
+    /// read directly — `nermo lockfile` decompresses and pretty-prints it
+    /// for exactly that.
     pub fn load(project_root: &Path) -> Result<Option<Self>> {
         let path = Self::path(project_root);
         if !path.is_file() {
             return Ok(None);
         }
-        let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let lock: Self = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let json = Self::read_decompressed(&path)?;
+        let lock: Self = serde_json::from_str(&json).with_context(|| format!("parsing {}", path.display()))?;
         if lock.lockfile_version != LOCKFILE_VERSION {
             bail!(
                 "{} was written by an incompatible lockfile version ({}, expected {}); delete it and reinstall",
@@ -157,18 +164,39 @@ impl Lockfile {
         Ok(Some(lock))
     }
 
+    fn read_decompressed(path: &Path) -> Result<String> {
+        let compressed = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let json = zstd::decode_all(compressed.as_slice())
+            .with_context(|| format!("{} is not a valid nermo lockfile (corrupt or from an incompatible version); delete it and reinstall", path.display()))?;
+        String::from_utf8(json).with_context(|| format!("{} did not decompress to valid UTF-8", path.display()))
+    }
+
+    /// Print the lockfile's decompressed JSON — the only supported way to
+    /// actually read it, since the on-disk file itself is compressed.
+    pub fn preview(project_root: &Path) -> Result<String> {
+        let path = Self::path(project_root);
+        if !path.is_file() {
+            bail!("no {} found in {}", FILE_NAME, project_root.display());
+        }
+        Self::read_decompressed(&path)
+    }
+
     /// Write the lockfile atomically, and skip the write entirely if the
     /// content wouldn't change (avoids an unnecessary rewrite per PRD §6.5).
+    /// zstd's output is deterministic for identical input at a fixed level,
+    /// so comparing freshly-compressed bytes against what's on disk is a
+    /// valid unchanged-check, same as the previous plain-text comparison.
     pub fn save(&self, project_root: &Path) -> Result<()> {
         let path = Self::path(project_root);
         let json = serde_json::to_string_pretty(self).context("serializing lockfile")?;
+        let compressed = zstd::encode_all(json.as_bytes(), 19).context("compressing lockfile")?;
 
-        if fs::read_to_string(&path).map(|existing| existing == json).unwrap_or(false) {
+        if fs::read(&path).map(|existing| existing == compressed).unwrap_or(false) {
             return Ok(());
         }
 
         let tmp_path = project_root.join(format!("{FILE_NAME}.tmp"));
-        fs::write(&tmp_path, &json).with_context(|| format!("writing {}", tmp_path.display()))?;
+        fs::write(&tmp_path, &compressed).with_context(|| format!("writing {}", tmp_path.display()))?;
         fs::rename(&tmp_path, &path).with_context(|| format!("committing {}", path.display()))?;
         Ok(())
     }
@@ -203,6 +231,51 @@ mod tests {
 
         let err = Lockfile::load(dir.path()).unwrap_err();
         assert!(err.to_string().contains("delete it and reinstall"));
+    }
+
+    #[test]
+    fn load_rejects_a_compressed_lockfile_from_an_older_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"lockfileVersion":1,"direct":{},"packages":{}}"#;
+        let compressed = zstd::encode_all(json.as_bytes(), 19).unwrap();
+        std::fs::write(dir.path().join(FILE_NAME), compressed).unwrap();
+
+        let err = Lockfile::load(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("delete it and reinstall"));
+    }
+
+    #[test]
+    fn save_then_load_round_trips_through_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let (direct_ranges, graph) = sample_graph();
+        let lock = Lockfile::from_graph(&direct_ranges, &graph);
+        lock.save(dir.path()).unwrap();
+
+        // On disk it's genuinely compressed, not plain JSON.
+        let raw = std::fs::read(dir.path().join(FILE_NAME)).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&raw).is_err(), "on-disk file should not be plain JSON");
+
+        let loaded = Lockfile::load(dir.path()).unwrap().expect("lockfile should exist");
+        assert_eq!(loaded.direct.len(), lock.direct.len());
+        assert_eq!(loaded.packages.len(), lock.packages.len());
+    }
+
+    #[test]
+    fn preview_returns_readable_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let (direct_ranges, graph) = sample_graph();
+        Lockfile::from_graph(&direct_ranges, &graph).save(dir.path()).unwrap();
+
+        let preview = Lockfile::preview(dir.path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&preview).expect("preview should be valid JSON");
+        assert_eq!(parsed["direct"]["debug"]["range"], "^4.3.0");
+    }
+
+    #[test]
+    fn preview_errors_clearly_when_no_lockfile_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = Lockfile::preview(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("no .nermo-lock found"));
     }
 
     fn sample_graph() -> (BTreeMap<String, String>, Graph) {

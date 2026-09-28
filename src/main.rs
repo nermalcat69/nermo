@@ -83,6 +83,9 @@ enum Command {
     },
     /// Diagnose common configuration and installation problems.
     Doctor,
+    /// Print .nermo-lock as readable JSON. The file on disk is
+    /// zstd-compressed, so it's not meant to be opened directly.
+    Lockfile,
     /// Download and install the latest nermo release in place of the
     /// running binary.
     Upgrade,
@@ -125,6 +128,7 @@ fn main() -> Result<()> {
         Command::Store { action: None } => store_stats(),
         Command::Store { action: Some(StoreCommand::Prune { dry_run, yes }) } => store_prune(dry_run, yes),
         Command::Doctor => doctor(),
+        Command::Lockfile => lockfile_preview(),
         Command::Upgrade => selfupdate::upgrade(),
         Command::Run(args) => run_script(&args),
     };
@@ -495,6 +499,12 @@ fn format_bytes(bytes: u64) -> String {
 /// and — when run inside a project — manifest/lockfile consistency and
 /// broken symlinks in node_modules. Never modifies anything; every check
 /// reports ok/warn/fail independently so one failure doesn't hide the rest.
+fn lockfile_preview() -> Result<()> {
+    let root = manifest::find_project_root(&env::current_dir().context("reading current directory")?)?;
+    println!("{}", lockfile::Lockfile::preview(&root)?);
+    Ok(())
+}
+
 fn doctor() -> Result<()> {
     println!("Nermo Doctor\n");
     let mut problems = 0usize;
