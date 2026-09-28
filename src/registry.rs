@@ -51,11 +51,28 @@ pub struct VersionMetadata {
     /// defaults to the package's own unscoped name) or a name->path map.
     #[serde(default, rename = "bin")]
     pub bin_field: Option<BinField>,
-    /// npm's `peerDependencies`: not fetched/resolved independently (see
-    /// `Resolver::link_peer_dependencies`) — only linked to an already-
-    /// resolved compatible version elsewhere in the graph, same as pnpm.
+    /// npm's `peerDependencies`. A peer NOT marked optional in
+    /// `peerDependenciesMeta` is resolved the same way a real dependency
+    /// is (reuse an existing compatible version, else fetch fresh) — real
+    /// npm/bun auto-install genuinely required peers by default. One
+    /// marked optional is only ever linked to an already-resolved version
+    /// elsewhere in the graph, never fetched independently: packages that
+    /// support several interchangeable drivers/integrations (e.g.
+    /// drizzle-orm listing pg/mysql2/better-sqlite3/... as peers) rely on
+    /// this to mean "don't install every one of these", not "install all
+    /// of them" — treating every peer as mandatory blew a real project's
+    /// graph from 456 to 2510 packages by pulling in every optional
+    /// driver of every such package, transitively.
     #[serde(default, rename = "peerDependencies")]
     pub peer_dependencies: BTreeMap<String, String>,
+    #[serde(default, rename = "peerDependenciesMeta")]
+    pub peer_dependencies_meta: BTreeMap<String, PeerDependencyMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PeerDependencyMeta {
+    #[serde(default)]
+    pub optional: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +229,7 @@ mod tests {
             cpu: None,
             bin_field,
             peer_dependencies: BTreeMap::new(),
+            peer_dependencies_meta: BTreeMap::new(),
         }
     }
 

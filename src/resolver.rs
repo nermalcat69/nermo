@@ -51,7 +51,7 @@ struct DiskCacheEntry {
 /// that field missing for up to a full TTL window instead of refetching).
 /// An entry with a mismatched (or, for pre-this-fix caches, absent/0)
 /// version is treated as a miss, same as an expired one.
-const CACHE_FORMAT_VERSION: u32 = 1;
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Default)]
 pub struct ResolvedPackage {
@@ -63,12 +63,6 @@ pub struct ResolvedPackage {
     /// npm package.json `bin` entries: shim name -> script path relative to
     /// the package root. Empty for the vast majority of packages.
     pub bin: BTreeMap<String, String>,
-    /// npm's `peerDependencies`, used only transiently by
-    /// `link_peer_dependencies` right after resolution finishes — by the
-    /// time this graph is persisted to a lockfile, any peer that could be
-    /// linked is already folded into `dependencies`, so this never needs
-    /// to round-trip through the lockfile itself.
-    pub peer_dependencies: BTreeMap<String, String>,
 }
 
 /// The complete dependency graph: every resolved package keyed by
@@ -103,6 +97,24 @@ pub struct Resolver<'a> {
 enum DepEdge {
     Required(String, String),
     Optional(String, String),
+    /// A `peerDependencies` entry NOT marked optional in
+    /// `peerDependenciesMeta` — real npm/bun auto-install these, so this
+    /// goes through the exact same path as `Required` (including
+    /// `resolve_one`'s own reuse-an-existing-version check), except a
+    /// failure (unpublished range, network hiccup) is swallowed rather
+    /// than failing the whole install: a peer is still advisory even when
+    /// "required" in the npm sense, real tools don't hard-fail an install
+    /// over an unmet peer.
+    Peer(String, String),
+    /// A `peerDependencies` entry marked `optional: true` in
+    /// `peerDependenciesMeta` — only ever linked to an already-resolved
+    /// version elsewhere in the graph, never independently fetched.
+    /// Packages that support several interchangeable drivers/integrations
+    /// (drizzle-orm listing pg/mysql2/better-sqlite3/... as peers) mark
+    /// every one of them this way specifically so tools *don't* install
+    /// all of them; treating these like `Peer` blew a real project's
+    /// graph from 456 to 2510 packages.
+    OptionalPeer(String, String),
 }
 
 impl<'a> Resolver<'a> {
@@ -167,62 +179,8 @@ impl<'a> Resolver<'a> {
         let items: Vec<DepEdge> =
             direct.iter().map(|(name, range)| DepEdge::Required(name.clone(), range.clone())).collect();
         let roots = self.fan_out(&items)?;
-        self.link_peer_dependencies();
         let packages = self.packages.into_inner().unwrap();
         Ok(Graph { packages, roots })
-    }
-
-    /// After the full graph is resolved, wire each package's
-    /// `peerDependencies` to an already-resolved compatible version
-    /// elsewhere in the graph, same as pnpm's peer-linking. A peer that
-    /// isn't already satisfied by something in the project is left
-    /// unresolved (advisory, matching real-world peer semantics) rather
-    /// than triggering an independent fresh resolution: a version nermo
-    /// picked on its own has no guarantee of being the one the rest of the
-    /// project actually uses, and the common real case (confirmed against
-    /// a real project) is that the peer is already a direct or transitive
-    /// dependency.
-    ///
-    /// This is what makes a package like `@posthog/react` (which only
-    /// requires `posthog-js` as a peer, not a regular dependency) a
-    /// correct non-leaf: without this, it had zero resolved dependency
-    /// edges, so the linker's leaf shortcut symlinked it straight to the
-    /// immutable store — where its own `import 'posthog-js'` then resolved
-    /// via the *store's* real path instead of the project's node_modules,
-    /// exactly the realpath-breaks-nested-resolution problem the
-    /// leaf/virtual-store split exists to avoid in the first place.
-    fn link_peer_dependencies(&self) {
-        let pending: Vec<(PackageKey, String, String)> = {
-            let packages = self.packages.lock().unwrap();
-            packages
-                .iter()
-                .flat_map(|(key, pkg)| {
-                    pkg.peer_dependencies.iter().filter_map(move |(name, range)| {
-                        if pkg.dependencies.iter().any(|e| &e.local_name == name) {
-                            None // already a real dependency edge too
-                        } else {
-                            Some((key.clone(), name.clone(), range.clone()))
-                        }
-                    })
-                })
-                .collect()
-        };
-
-        let resolved: Vec<(PackageKey, DependencyEdge)> = pending
-            .into_iter()
-            .filter_map(|(key, name, range)| {
-                self.find_reusable_version(&name, &range).map(|peer_key| {
-                    (key, DependencyEdge { local_name: name, key: peer_key })
-                })
-            })
-            .collect();
-
-        let mut packages = self.packages.lock().unwrap();
-        for (key, edge) in resolved {
-            if let Some(pkg) = packages.get_mut(&key) {
-                pkg.dependencies.push(edge);
-            }
-        }
     }
 
     /// npm dependency aliases look like `"local-name": "npm:real-name@range"`
@@ -271,6 +229,13 @@ impl<'a> Resolver<'a> {
                 }
                 DepEdge::Optional(local_name, range) => self
                     .resolve_optional(local_name, range)
+                    .map(|key| DependencyEdge { local_name: local_name.clone(), key }),
+                DepEdge::Peer(local_name, range) => self
+                    .resolve_one(local_name, range)
+                    .ok()
+                    .map(|key| DependencyEdge { local_name: local_name.clone(), key }),
+                DepEdge::OptionalPeer(local_name, range) => self
+                    .find_reusable_version(local_name, range)
                     .map(|key| DependencyEdge { local_name: local_name.clone(), key }),
             };
             if let Some(edge) = edge {
@@ -337,12 +302,25 @@ impl<'a> Resolver<'a> {
                 .map(|(n, r)| DepEdge::Required(n.clone(), r.clone())),
         );
         items.extend(vmeta.optional_dependencies.iter().map(|(n, r)| DepEdge::Optional(n.clone(), r.clone())));
+        items.extend(
+            vmeta
+                .peer_dependencies
+                .iter()
+                .filter(|(n, _)| !vmeta.dependencies.contains_key(*n) && !vmeta.optional_dependencies.contains_key(*n))
+                .map(|(n, r)| {
+                    let optional = vmeta.peer_dependencies_meta.get(n).is_some_and(|m| m.optional);
+                    if optional {
+                        DepEdge::OptionalPeer(n.clone(), r.clone())
+                    } else {
+                        DepEdge::Peer(n.clone(), r.clone())
+                    }
+                }),
+        );
         let edges = self.fan_out(&items)?;
 
         let mut packages = self.packages.lock().unwrap();
         let entry = packages.get_mut(&key).expect("just inserted");
         entry.bin = vmeta.bin_entries();
-        entry.peer_dependencies = vmeta.peer_dependencies.clone();
         entry.tarball = vmeta.dist.tarball;
         entry.integrity = vmeta.dist.integrity;
         entry.shasum = vmeta.dist.shasum;
@@ -516,6 +494,7 @@ mod tests {
                             cpu: None,
                             bin_field: None,
                             peer_dependencies: BTreeMap::new(),
+                            peer_dependencies_meta: BTreeMap::new(),
                         },
                     )
                 })
@@ -581,71 +560,51 @@ mod tests {
     }
 
     #[test]
-    fn link_peer_dependencies_wires_a_peer_already_resolved_elsewhere() {
+    fn peer_edge_reuses_an_already_resolved_compatible_version() {
         let client = Client::new().unwrap();
         let resolver = Resolver::new(&client);
-        {
-            let mut packages = resolver.packages.lock().unwrap();
-            // The real repro: @posthog/react only lists posthog-js as a
-            // peer, not a regular dependency, so it starts with zero
-            // dependency edges (a false "leaf").
-            packages.insert(
-                ("@posthog/react".to_string(), "1.11.2".to_string()),
-                ResolvedPackage {
-                    peer_dependencies: BTreeMap::from([("posthog-js".to_string(), "^1.0.0".to_string())]),
-                    ..Default::default()
-                },
-            );
-            packages.insert(("posthog-js".to_string(), "1.434.15".to_string()), ResolvedPackage::default());
-        }
+        // The real repro: @posthog/react only lists posthog-js as a peer,
+        // not a regular dependency. resolve_one's own reuse-check (the
+        // same one Required edges get) means this never needs a network
+        // call when a compatible version is already in the graph.
+        resolver
+            .packages
+            .lock()
+            .unwrap()
+            .insert(("posthog-js".to_string(), "1.434.15".to_string()), ResolvedPackage::default());
 
-        resolver.link_peer_dependencies();
+        let items = vec![DepEdge::Peer("posthog-js".to_string(), "^1.0.0".to_string())];
+        let edges = resolver.fan_out(&items).unwrap();
 
-        let packages = resolver.packages.lock().unwrap();
-        let pkg = &packages[&("@posthog/react".to_string(), "1.11.2".to_string())];
-        assert_eq!(pkg.dependencies.len(), 1);
-        assert_eq!(pkg.dependencies[0].local_name, "posthog-js");
-        assert_eq!(pkg.dependencies[0].key, ("posthog-js".to_string(), "1.434.15".to_string()));
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].local_name, "posthog-js");
+        assert_eq!(edges[0].key, ("posthog-js".to_string(), "1.434.15".to_string()));
     }
 
     #[test]
-    fn link_peer_dependencies_leaves_an_unmet_peer_unresolved() {
+    fn optional_peer_edge_links_when_already_resolved_but_never_fetches_fresh() {
         let client = Client::new().unwrap();
         let resolver = Resolver::new(&client);
-        resolver.packages.lock().unwrap().insert(
-            ("some-plugin".to_string(), "1.0.0".to_string()),
-            ResolvedPackage {
-                peer_dependencies: BTreeMap::from([("react".to_string(), "^19.0.0".to_string())]),
-                ..Default::default()
-            },
-        );
+        resolver
+            .packages
+            .lock()
+            .unwrap()
+            .insert(("pg".to_string(), "8.11.6".to_string()), ResolvedPackage::default());
 
-        resolver.link_peer_dependencies();
+        // Present in the graph already (some other package really uses pg):
+        // OptionalPeer links it, exactly like a real peer would.
+        let linked = resolver.fan_out(&[DepEdge::OptionalPeer("pg".to_string(), "^8.0.0".to_string())]).unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].key, ("pg".to_string(), "8.11.6".to_string()));
 
-        let packages = resolver.packages.lock().unwrap();
-        assert!(packages[&("some-plugin".to_string(), "1.0.0".to_string())].dependencies.is_empty());
-    }
-
-    #[test]
-    fn link_peer_dependencies_does_not_duplicate_an_existing_real_dependency_edge() {
-        let client = Client::new().unwrap();
-        let resolver = Resolver::new(&client);
-        resolver.packages.lock().unwrap().insert(
-            ("some-lib".to_string(), "1.0.0".to_string()),
-            ResolvedPackage {
-                dependencies: vec![DependencyEdge {
-                    local_name: "shared".to_string(),
-                    key: ("shared".to_string(), "1.0.0".to_string()),
-                }],
-                peer_dependencies: BTreeMap::from([("shared".to_string(), "^1.0.0".to_string())]),
-                ..Default::default()
-            },
-        );
-
-        resolver.link_peer_dependencies();
-
-        let packages = resolver.packages.lock().unwrap();
-        assert_eq!(packages[&("some-lib".to_string(), "1.0.0".to_string())].dependencies.len(), 1);
+        // Not present at all (the real drizzle-orm case: mysql2, sqlite,
+        // etc. are all listed as optional peers but the project uses none
+        // of them): must resolve to nothing. OptionalPeer's fan_out arm
+        // only ever calls find_reusable_version (no metadata fetch, no
+        // network I/O at all), so an unmet one is structurally guaranteed
+        // to never trigger an independent download.
+        let unmet = resolver.fan_out(&[DepEdge::OptionalPeer("mysql2".to_string(), "^3.0.0".to_string())]).unwrap();
+        assert!(unmet.is_empty());
     }
 
     #[test]
