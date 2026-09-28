@@ -31,11 +31,16 @@ attaches them to a GitHub Release automatically.
 
 ```bash
 cd your-project         # any project with a package.json
-nermo install            # resolve, download into the shared store, link node_modules
-nermo install --frozen   # require .nermo-lock to be present and up to date; never re-resolve
-nermo install --no-prune # skip the default after-install prune (on by default, see below)
-nermo install --force    # take over node_modules entries left by another package manager (bun/npm/pnpm)
-nermo remove react zod   # remove dependencies from package.json and reinstall to match
+nermo install             # resolve, download into the shared store, link node_modules
+nermo i                   # alias for nermo install
+nermo install --frozen    # require .nermo-lock to be present and up to date; never re-resolve
+nermo install --no-prune  # skip the default after-install prune (on by default, see below)
+nermo install --force     # take over node_modules entries left by another package manager (bun/npm/pnpm)
+nermo add dotenv          # add a dependency (latest version) to package.json and install
+nermo add -D vitest       # add to devDependencies instead
+nermo add zod@^4.0.0      # add at a specific version/range
+nermo install dotenv      # same as `nermo add dotenv` — also works as `nermo i dotenv`
+nermo remove react zod    # remove dependencies from package.json and reinstall to match
 nermo fetch react@19.0.0 # ensure one package version is in the store, without installing a project
 nermo store               # show store stats (packages, disk usage, tracked projects)
 nermo store prune         # remove packages no tracked project references (supports --dry-run, --yes)

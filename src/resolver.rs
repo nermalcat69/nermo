@@ -508,7 +508,7 @@ fn current_cpu() -> &'static str {
 /// packages' peerDependencies) by splitting on `||` and matching any side.
 /// Not supported: hyphen ranges ("1.2.3 - 2.3.4") and dist-tags like
 /// "latest" — real npm ranges the MVP resolver still doesn't parse.
-fn pick_version(name: &str, range: &str, meta: &PackageMetadata) -> Result<String> {
+pub fn pick_version(name: &str, range: &str, meta: &PackageMetadata) -> Result<String> {
     if let Ok(exact) = Version::parse(range) {
         let exact = exact.to_string();
         if meta.versions.contains_key(&exact) {

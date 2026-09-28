@@ -24,9 +24,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Discover the project and show what would be installed.
+    /// Discover the project and show what would be installed. Given one or
+    /// more package names, adds them to package.json first (same as
+    /// `nermo add`) — e.g. `nermo install dotenv` or `nermo i dotenv`.
+    #[command(visible_alias = "i")]
     Install {
+        /// Package(s) to add first, e.g. "dotenv" or "dotenv@^16.0.0".
+        /// Installs from the existing package.json if none are given.
+        packages: Vec<String>,
+        /// With one or more packages given: add to devDependencies instead
+        /// of dependencies.
+        #[arg(long, short = 'D')]
+        dev: bool,
         /// Require a compatible, up-to-date lockfile; never re-resolve.
+        /// Ignored when adding packages (package.json is changing, so
+        /// there's necessarily something new to resolve).
         #[arg(long)]
         frozen: bool,
         /// Skip the after-install prune (on by default): removing any store
@@ -42,6 +54,15 @@ enum Command {
         /// didn't create.
         #[arg(long)]
         force: bool,
+    },
+    /// Add one or more packages to package.json and install (same as
+    /// `nermo install <packages>`).
+    Add {
+        #[arg(required = true)]
+        packages: Vec<String>,
+        /// Add to devDependencies instead of dependencies.
+        #[arg(long, short = 'D')]
+        dev: bool,
     },
     /// Ensure a package version is present in the global store, downloading
     /// it only if it isn't already cached (Phase 2 registry + Phase 3 store).
@@ -91,7 +112,14 @@ fn main() -> Result<()> {
     let is_upgrade = matches!(cli.command, Command::Upgrade);
 
     let result = match cli.command {
-        Command::Install { frozen, no_prune, force } => install(frozen, !no_prune, force),
+        Command::Install { packages, dev, frozen, no_prune, force } => {
+            if packages.is_empty() {
+                install(frozen, !no_prune, force)
+            } else {
+                add(&packages, dev).and_then(|_| install(false, !no_prune, force))
+            }
+        }
+        Command::Add { packages, dev } => add(&packages, dev).and_then(|_| install(false, true, false)),
         Command::Fetch { spec } => fetch(&spec),
         Command::Remove { names } => remove(&names),
         Command::Store { action: None } => store_stats(),
@@ -160,6 +188,38 @@ fn run_script(args: &[String]) -> Result<()> {
 
     selfupdate::notify_if_update_available();
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// `nermo add <specs...>` / `nermo install <specs...>`: resolve each spec
+/// to a version range and write it into package.json. A spec without a
+/// version ("dotenv") gets the highest published version, npm-`^`-style
+/// (matching what `npm install <pkg>` / `npm i <pkg>` do); a spec with one
+/// ("dotenv@^16.0.0", "@types/node@22.0.0") uses it as-is. Doesn't touch
+/// node_modules or the lockfile itself — the caller always follows this
+/// with a real `install()` to actually resolve and link.
+fn add(specs: &[String], dev: bool) -> Result<()> {
+    let root = manifest::find_project_root(&env::current_dir().context("reading current directory")?)?;
+    let client = registry::Client::new()?;
+
+    let mut resolved = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let (name, range) = match spec.rsplit_once('@').filter(|(n, _)| !n.is_empty()) {
+            Some((n, r)) => (n.to_string(), r.to_string()),
+            None => {
+                let meta = client.package_metadata(spec).with_context(|| format!("looking up {spec}"))?;
+                let latest = resolver::pick_version(spec, "*", &meta)?;
+                (spec.clone(), format!("^{latest}"))
+            }
+        };
+        resolved.push((name, range));
+    }
+
+    for (name, range) in &resolved {
+        println!("+ {name}@{range}");
+    }
+    manifest::add_dependencies(&root, &resolved, dev)?;
+    println!();
+    Ok(())
 }
 
 fn fetch(spec: &str) -> Result<()> {
