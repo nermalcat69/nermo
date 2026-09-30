@@ -106,3 +106,19 @@ jitter (both tools fetch essentially the same registry payloads for
 `react`/`react-dom`, whose abbreviated metadata documents run 1-3MB each
 even compressed — that part is inherent to correct semver resolution against
 the real registry, not something either tool can trim further).
+
+## Update — dist-tag fast path for the common case
+
+That "1-3MB even compressed" cost above isn't actually unavoidable for most
+packages, just for ones pinned behind a newer major (`react`/`react-dom` in
+this manifest). Added a fast path (`Resolver::latest_if_satisfies`,
+`src/resolver.rs`): try the registry's tiny single-version `latest`
+dist-tag endpoint (a couple KB) first, and only fetch the full multi-version
+document when `latest` doesn't satisfy the edge's range. Verified directly:
+`lodash@^4.17.21` (satisfied by its actual latest) now resolves in **315ms**
+via the fast path, down from paying for the full document; `react@^18.3.1`
+(latest is 19.x) correctly falls back to the full document, unaffected. On
+this benchmark's specific manifest the win is partial (`react`/`react-dom`
+still need the fallback), but on manifests without a stale major pin —
+the common case for an actively maintained project — this turns a
+multi-MB-per-package cost into a few KB.
