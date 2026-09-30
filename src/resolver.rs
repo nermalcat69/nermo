@@ -1,5 +1,5 @@
 use crate::concurrency::parallel_for_each;
-use crate::registry::{Client, PackageMetadata};
+use crate::registry::{Client, PackageMetadata, VersionMetadata};
 use anyhow::{anyhow, Context, Result};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -275,6 +275,23 @@ impl<'a> Resolver<'a> {
         Ok(cache.entry(name.to_string()).or_insert(fetched).clone())
     }
 
+    /// Fast path: an actively maintained project's caret/tilde range is
+    /// overwhelmingly satisfied by whatever's currently tagged `latest` on
+    /// the registry. The single-version endpoint for a dist-tag is a couple
+    /// KB; `metadata()`'s full multi-version document (needed to pick an
+    /// older version when `latest` doesn't satisfy the range) runs 1-3MB+
+    /// for a popular package like `react` even compressed — real cost
+    /// measured directly while benchmarking against bun's cold installs.
+    /// Silently returns `None` on any failure (network error, or `latest`
+    /// genuinely not satisfying an older-pinned range) so the caller falls
+    /// back to the full, always-correct path — this must never turn a
+    /// resolvable package into an error, only skip work when it safely can.
+    fn latest_if_satisfies(&self, name: &str, range: &str) -> Option<(String, VersionMetadata)> {
+        let vmeta = self.client.version_metadata(name, "latest").ok()?;
+        let version = Version::parse(&vmeta.version).ok()?;
+        version_satisfies(&version, range).then(|| (version.to_string(), vmeta))
+    }
+
     /// Resolve a batch of dependency edges concurrently and return the
     /// resulting edges (order is not meaningful — nothing downstream depends
     /// on dependency-edge order).
@@ -321,8 +338,15 @@ impl<'a> Resolver<'a> {
             return Ok(reused);
         }
 
-        let meta = self.metadata(name)?;
-        let version = pick_version(name, range, &meta)?;
+        let (version, vmeta) = match self.latest_if_satisfies(name, range) {
+            Some(hit) => hit,
+            None => {
+                let meta = self.metadata(name)?;
+                let version = pick_version(name, range, &meta)?;
+                let vmeta = meta.versions[&version].clone();
+                (version, vmeta)
+            }
+        };
         let key: PackageKey = (name.to_string(), version.clone());
 
         // Check-and-claim happens under one lock acquisition, so concurrent
@@ -341,7 +365,6 @@ impl<'a> Resolver<'a> {
             );
         }
 
-        let vmeta = meta.versions[&version].clone();
         // npm semantics: a name present in both `dependencies` and
         // `optionalDependencies` is optional — the optional entry overrides
         // the dependencies one. esbuild@0.18.20's platform binaries are
@@ -528,6 +551,22 @@ fn to_cargo_comparator_syntax(part: &str) -> String {
         }
     }
     comparators.join(", ")
+}
+
+/// Whether `version` satisfies an npm-style range: an exact version, or one
+/// or more `||`-joined comparator sets (normalized via
+/// `to_cargo_comparator_syntax` for npm's whitespace-AND form). Used by the
+/// dist-tag fast path to check one specific candidate — deliberately
+/// returns `false` rather than an error for genuinely unsupported syntax,
+/// since the caller's fallback path raises the real error if the range
+/// truly isn't supported.
+fn version_satisfies(version: &Version, range: &str) -> bool {
+    if let Ok(exact) = Version::parse(range) {
+        return *version == exact;
+    }
+    range
+        .split("||")
+        .any(|part| VersionReq::parse(&to_cargo_comparator_syntax(part.trim())).is_ok_and(|req| req.matches(version)))
 }
 
 /// Pick the highest published version satisfying `range`.
@@ -862,6 +901,21 @@ mod tests {
         let meta = fake_metadata(&["2.1.2", "2.2.0", "3.0.0"]);
         assert_eq!(pick_version("safer-buffer", ">= 2.1.2 < 3", &meta).unwrap(), "2.2.0");
         assert!(pick_version("safer-buffer", ">= 2.1.2 < 3", &fake_metadata(&["3.0.0"])).is_err());
+    }
+
+    #[test]
+    fn version_satisfies_backs_the_dist_tag_fast_path() {
+        // The exact question `latest_if_satisfies` asks: does the version
+        // currently tagged "latest" satisfy this edge's range? True for an
+        // actively-maintained package on its current major (lodash's real
+        // case); false once a range is pinned behind a later major release
+        // (react's real case, ^18.x against an actual latest of 19.x).
+        assert!(version_satisfies(&Version::parse("4.17.21").unwrap(), "^4.17.21"));
+        assert!(!version_satisfies(&Version::parse("19.3.0").unwrap(), "^18.3.1"));
+        assert!(version_satisfies(&Version::parse("2.2.0").unwrap(), ">= 2.1.2 < 3"));
+        assert!(version_satisfies(&Version::parse("0.29.5").unwrap(), "^0.28.17 || ^0.29.0"));
+        assert!(version_satisfies(&Version::parse("1.2.3").unwrap(), "1.2.3"));
+        assert!(!version_satisfies(&Version::parse("1.2.4").unwrap(), "1.2.3"));
     }
 
     #[test]
