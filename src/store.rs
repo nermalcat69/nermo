@@ -27,7 +27,7 @@ impl Store {
         Ok(store)
     }
 
-    /// Delete registry metadata cache entries (`cache/registry/*.json`)
+    /// Delete registry metadata cache entries (`cache/registry/*.json.zst`)
     /// that haven't been refreshed in `CACHE_MAX_AGE_SECS` — a project
     /// nobody's touched in a month shouldn't leave its packages' cached
     /// metadata sitting on disk forever. `fetched_at_unix` is a good proxy
@@ -61,12 +61,13 @@ impl Store {
         if let Ok(entries) = fs::read_dir(self.root.join("cache").join("registry")) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                if path.extension().and_then(|e| e.to_str()) != Some("zst") {
                     continue;
                 }
-                let stale = fs::read_to_string(&path)
+                let stale = fs::read(&path)
                     .ok()
-                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                    .and_then(|compressed| zstd::decode_all(compressed.as_slice()).ok())
+                    .and_then(|json| serde_json::from_slice::<serde_json::Value>(&json).ok())
                     .and_then(|v| v.get("fetched_at_unix").and_then(|f| f.as_u64()))
                     .is_some_and(|fetched_at| now.saturating_sub(fetched_at) > MAX_AGE_SECS);
                 if stale {
@@ -468,10 +469,13 @@ mod tests {
         fs::create_dir_all(&cache_dir).unwrap();
 
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let stale = cache_dir.join("abandoned-package.json");
-        let fresh = cache_dir.join("actively-used-package.json");
-        fs::write(&stale, format!(r#"{{"fetched_at_unix":{},"metadata":{{"versions":{{}}}}}}"#, now - 40 * 24 * 60 * 60)).unwrap();
-        fs::write(&fresh, format!(r#"{{"fetched_at_unix":{},"metadata":{{"versions":{{}}}}}}"#, now - 60)).unwrap();
+        let stale = cache_dir.join("abandoned-package.json.zst");
+        let fresh = cache_dir.join("actively-used-package.json.zst");
+        let compress = |fetched_at: u64| {
+            zstd::encode_all(format!(r#"{{"fetched_at_unix":{},"metadata":{{"versions":{{}}}}}}"#, fetched_at).as_bytes(), 3).unwrap()
+        };
+        fs::write(&stale, compress(now - 40 * 24 * 60 * 60)).unwrap();
+        fs::write(&fresh, compress(now - 60)).unwrap();
 
         store.sweep_stale_registry_cache();
 
@@ -487,8 +491,13 @@ mod tests {
         fs::create_dir_all(&cache_dir).unwrap();
 
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let stale = cache_dir.join("old-package.json");
-        fs::write(&stale, format!(r#"{{"fetched_at_unix":{},"metadata":{{"versions":{{}}}}}}"#, now - 40 * 24 * 60 * 60)).unwrap();
+        let stale = cache_dir.join("old-package.json.zst");
+        let compressed = zstd::encode_all(
+            format!(r#"{{"fetched_at_unix":{},"metadata":{{"versions":{{}}}}}}"#, now - 40 * 24 * 60 * 60).as_bytes(),
+            3,
+        )
+        .unwrap();
+        fs::write(&stale, &compressed).unwrap();
 
         store.sweep_stale_registry_cache();
         assert!(!stale.exists());
@@ -496,7 +505,7 @@ mod tests {
         // A fresh entry arriving right after the sweep must survive a
         // second call made immediately after — the sweep should be
         // throttled by its own marker, not re-walk the directory.
-        fs::write(&stale, format!(r#"{{"fetched_at_unix":{},"metadata":{{"versions":{{}}}}}}"#, now - 40 * 24 * 60 * 60)).unwrap();
+        fs::write(&stale, &compressed).unwrap();
         store.sweep_stale_registry_cache();
         assert!(stale.exists(), "immediate re-sweep should be throttled by the marker");
     }

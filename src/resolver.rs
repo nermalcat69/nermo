@@ -136,13 +136,14 @@ impl<'a> Resolver<'a> {
     }
 
     fn disk_cache_path(&self, name: &str) -> Option<PathBuf> {
-        self.disk_cache_dir.as_ref().map(|dir| dir.join(format!("{}.json", name.replace('/', "+"))))
+        self.disk_cache_dir.as_ref().map(|dir| dir.join(format!("{}.json.zst", name.replace('/', "+"))))
     }
 
     fn read_disk_cache(&self, name: &str) -> Option<PackageMetadata> {
         let path = self.disk_cache_path(name)?;
-        let text = std::fs::read_to_string(&path).ok()?;
-        let entry: DiskCacheEntry = serde_json::from_str(&text).ok()?;
+        let compressed = std::fs::read(&path).ok()?;
+        let json = zstd::decode_all(compressed.as_slice()).ok()?;
+        let entry: DiskCacheEntry = serde_json::from_slice(&json).ok()?;
         if entry.format_version != CACHE_FORMAT_VERSION {
             return None;
         }
@@ -154,7 +155,12 @@ impl<'a> Resolver<'a> {
     }
 
     /// Best-effort: a failure to persist the cache should never fail (or
-    /// even be noticed by) the resolve it's optimizing.
+    /// even be noticed by) the resolve it's optimizing. Compressed with
+    /// zstd (level 3, not the lockfile's 19 — this runs once per package
+    /// *per resolve*, often dozens concurrently, so it's optimized for
+    /// speed over the last few percent of ratio) so a store shared across
+    /// many projects doesn't accumulate gigabytes of near-identical
+    /// registry metadata JSON.
     fn write_disk_cache(&self, name: &str, metadata: &PackageMetadata) {
         let Some(path) = self.disk_cache_path(name) else { return };
         let Some(dir) = path.parent() else { return };
@@ -163,8 +169,10 @@ impl<'a> Resolver<'a> {
         }
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let entry = DiskCacheEntry { format_version: CACHE_FORMAT_VERSION, fetched_at_unix: now, metadata: metadata.clone() };
-        if let Ok(json) = serde_json::to_string(&entry) {
-            let _ = std::fs::write(&path, json);
+        if let Ok(json) = serde_json::to_vec(&entry) {
+            if let Ok(compressed) = zstd::encode_all(json.as_slice(), 3) {
+                let _ = std::fs::write(&path, compressed);
+            }
         }
     }
 
@@ -752,7 +760,8 @@ mod tests {
             metadata: meta,
         };
         let path = resolver.disk_cache_path("demo").unwrap();
-        std::fs::write(&path, serde_json::to_string(&stale_entry).unwrap()).unwrap();
+        let compressed = zstd::encode_all(serde_json::to_vec(&stale_entry).unwrap().as_slice(), 3).unwrap();
+        std::fs::write(&path, compressed).unwrap();
 
         assert!(resolver.read_disk_cache("demo").is_none(), "an expired entry must not be trusted");
     }
@@ -770,7 +779,8 @@ mod tests {
             metadata: meta,
         };
         let path = resolver.disk_cache_path("demo").unwrap();
-        std::fs::write(&path, serde_json::to_string(&old_schema_entry).unwrap()).unwrap();
+        let compressed = zstd::encode_all(serde_json::to_vec(&old_schema_entry).unwrap().as_slice(), 3).unwrap();
+        std::fs::write(&path, compressed).unwrap();
 
         assert!(
             resolver.read_disk_cache("demo").is_none(),
@@ -785,7 +795,7 @@ mod tests {
         let resolver = Resolver::new(&client).with_disk_cache(dir.path().to_path_buf());
         let path = resolver.disk_cache_path("@types/node").unwrap();
         assert!(!path.to_string_lossy().contains('/') || path.starts_with(dir.path()));
-        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "@types+node.json");
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "@types+node.json.zst");
     }
 
     #[test]
