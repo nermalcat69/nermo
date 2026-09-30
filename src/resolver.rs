@@ -415,7 +415,8 @@ impl<'a> Resolver<'a> {
         // VersionReq::parse doesn't understand "||" at all, so without this
         // split, every reuse check against an OR range silently failed to
         // match anything real, even an exact, already-resolved version.
-        let reqs: Vec<VersionReq> = range.split("||").filter_map(|part| VersionReq::parse(part.trim()).ok()).collect();
+        let reqs: Vec<VersionReq> =
+            range.split("||").filter_map(|part| VersionReq::parse(&to_cargo_comparator_syntax(part.trim())).ok()).collect();
         if reqs.is_empty() {
             return None;
         }
@@ -509,13 +510,35 @@ fn current_cpu() -> &'static str {
     }
 }
 
+/// npm/node-semver joins comparators with bare whitespace to mean AND (e.g.
+/// `">= 2.1.2 < 3"`, `safer-buffer`'s actual published range) and also
+/// allows whitespace between an operator and its version (`">= 2.1.2"`).
+/// Rust's `semver` crate only accepts Cargo's comma-separated form for the
+/// same thing (`">=2.1.2, <3"`) and errors outright on the bare-whitespace
+/// form. Reattaches a lone operator token to the version token that follows
+/// it, then joins the resulting comparators with commas so `VersionReq`
+/// accepts what it already supports semantically, just not syntactically.
+fn to_cargo_comparator_syntax(part: &str) -> String {
+    let is_bare_operator = |word: &str| !word.chars().any(|c| c.is_ascii_digit() || c == '*' || c == 'x' || c == 'X');
+    let mut comparators: Vec<String> = Vec::new();
+    for word in part.split_whitespace() {
+        match comparators.last_mut() {
+            Some(last) if !is_bare_operator(word) && is_bare_operator(last) => last.push_str(word),
+            _ => comparators.push(word.to_string()),
+        }
+    }
+    comparators.join(", ")
+}
+
 /// Pick the highest published version satisfying `range`.
 ///
 /// Supports exact versions, Cargo/semver-style comparator ranges (`^`, `~`,
-/// `>=`, `*`, ...), and OR ranges ("^0.28.0 || ^0.29.0", common in real
-/// packages' peerDependencies) by splitting on `||` and matching any side.
-/// Not supported: hyphen ranges ("1.2.3 - 2.3.4") and dist-tags like
-/// "latest" — real npm ranges the MVP resolver still doesn't parse.
+/// `>=`, `*`, ...), npm-style whitespace-joined AND ranges (`">= 2.1.2 < 3"`,
+/// via `to_cargo_comparator_syntax`), and OR ranges ("^0.28.0 || ^0.29.0",
+/// common in real packages' peerDependencies) by splitting on `||` and
+/// matching any side. Not supported: hyphen ranges ("1.2.3 - 2.3.4") and
+/// dist-tags like "latest" — real npm ranges the MVP resolver still doesn't
+/// parse.
 pub fn pick_version(name: &str, range: &str, meta: &PackageMetadata) -> Result<String> {
     if let Ok(exact) = Version::parse(range) {
         let exact = exact.to_string();
@@ -526,7 +549,7 @@ pub fn pick_version(name: &str, range: &str, meta: &PackageMetadata) -> Result<S
 
     let reqs: Vec<VersionReq> = range
         .split("||")
-        .map(|part| VersionReq::parse(part.trim()))
+        .map(|part| VersionReq::parse(&to_cargo_comparator_syntax(part.trim())))
         .collect::<std::result::Result<_, _>>()
         .with_context(|| format!("unsupported version range {range:?} for {name}"))?;
 
@@ -829,6 +852,16 @@ mod tests {
         // adapters looks like "^0.28.17 || ^0.29.0" — matches should span
         // both sides but stay within each caret range's ceiling.
         assert_eq!(pick_version("demo", "^0.28.17 || ^0.29.0", &meta).unwrap(), "0.29.5");
+    }
+
+    #[test]
+    fn npm_style_whitespace_and_range_is_supported() {
+        // safer-buffer's actual published range, which broke resolution
+        // entirely before `to_cargo_comparator_syntax` (Rust's `semver`
+        // crate only accepts the comma-separated Cargo form).
+        let meta = fake_metadata(&["2.1.2", "2.2.0", "3.0.0"]);
+        assert_eq!(pick_version("safer-buffer", ">= 2.1.2 < 3", &meta).unwrap(), "2.2.0");
+        assert!(pick_version("safer-buffer", ">= 2.1.2 < 3", &fake_metadata(&["3.0.0"])).is_err());
     }
 
     #[test]

@@ -114,6 +114,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let is_upgrade = matches!(cli.command, Command::Upgrade);
 
+    // Kicked off up front and joined after the command's own work, instead
+    // of running after it: the update check is a GitHub API round trip
+    // (~0.4-1s), and running it sequentially after a small/fast install
+    // (e.g. one package, well under 1s) tacked its full latency onto the
+    // very end — real gap measured directly (`NERMO_NO_UPDATE_CHECK=1` cut
+    // a cold one-package install from ~2.1s to ~1.0s wall time with
+    // identical resolve/store/link numbers). Overlapping it with the
+    // command's own network activity means a command that already takes
+    // longer than the check (most real installs) pays nothing extra.
+    let mut update_check = (!is_upgrade).then(|| std::thread::spawn(selfupdate::notify_if_update_available));
+
     let result = match cli.command {
         Command::Install { packages, dev, frozen, no_prune, force } => {
             if packages.is_empty() {
@@ -130,15 +141,13 @@ fn main() -> Result<()> {
         Command::Doctor => doctor(),
         Command::Lockfile => lockfile_preview(),
         Command::Upgrade => selfupdate::upgrade(),
-        Command::Run(args) => run_script(&args),
+        Command::Run(args) => run_script(&args, update_check.take()),
     };
 
-    // Runs on every command except `upgrade` itself: a cheap, cached,
-    // best-effort check (see selfupdate::notify_if_update_available) so a
-    // newer release surfaces on its own instead of requiring the user to
-    // remember to check. Never affects this command's own exit code.
-    if !is_upgrade {
-        selfupdate::notify_if_update_available();
+    // Never affects this command's own exit code — the thread's own
+    // function swallows every failure mode itself, so joining it can't fail.
+    if let Some(handle) = update_check {
+        let _ = handle.join();
     }
 
     result
@@ -149,7 +158,7 @@ fn main() -> Result<()> {
 /// `node_modules/.bin` prepended to PATH, so a script that shells out to a
 /// dependency's CLI (react-router, vite, wrangler, ...) finds it without a
 /// global install. Exits with the script's own exit code.
-fn run_script(args: &[String]) -> Result<()> {
+fn run_script(args: &[String], update_check: Option<std::thread::JoinHandle<()>>) -> Result<()> {
     let Some((script_name, extra_args)) = args.split_first() else {
         anyhow::bail!("usage: nermo <script> [args...]");
     };
@@ -190,7 +199,13 @@ fn run_script(args: &[String]) -> Result<()> {
         .status()
         .with_context(|| format!("running script {script_name:?}"))?;
 
-    selfupdate::notify_if_update_available();
+    // Spawned back in `main`, overlapping with the script's own run instead
+    // of running after it; joined here (not left to `main`'s own join,
+    // which this `exit` bypasses) since a script's runtime dwarfs the
+    // update check's ~0.4-1s in virtually every real case.
+    if let Some(handle) = update_check {
+        let _ = handle.join();
+    }
     std::process::exit(status.code().unwrap_or(1));
 }
 
