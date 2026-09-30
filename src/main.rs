@@ -1,13 +1,4 @@
-mod archive;
-mod concurrency;
-mod linker;
-mod lockfile;
-mod manifest;
-mod progress;
-mod registry;
-mod resolver;
-mod selfupdate;
-mod store;
+use nermo::{linker, lockfile, manifest, progress, registry, resolver, selfupdate, store};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

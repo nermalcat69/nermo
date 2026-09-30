@@ -3,6 +3,10 @@ name = "nermo"
 version = "0.0.1"
 edition = "2024"
 
+[lib]
+name = "nermo"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"
